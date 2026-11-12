@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zarnkina Remote Control</title>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg:#07090e; --panel:rgba(16,20,32,.88); --border:rgba(255,255,255,.1); --brand:#6366f1; --ok:#10b981; --fg:#f8fafc; --muted:#94a3b8; }
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { background:var(--bg); color:var(--fg); font-family:'Plus Jakarta Sans',sans-serif; min-height:100vh; padding:20px; display:flex; flex-direction:column; align-items:center; }
+    .wrap { width:100%; max-width:720px; }
+    .head { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding-bottom:14px; border-bottom:1px solid var(--border); }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:22px; margin-bottom:16px; }
+    input, textarea { width:100%; background:#04060a; border:1px solid var(--border); border-radius:10px; color:#fff; padding:11px 14px; font-family:inherit; font-size:14px; outline:none; }
+    input:focus, textarea:focus { border-color:var(--brand); }
+    .btn { background:var(--brand); color:#fff; border:none; border-radius:10px; padding:11px 18px; font-weight:700; font-size:14px; cursor:pointer; }
+    .btn.ghost { background:rgba(255,255,255,.06); border:1px solid var(--border); }
+    .code-in { text-align:center; font-family:'JetBrains Mono',monospace; font-size:26px; letter-spacing:8px; font-weight:700; }
+    #log { display:flex; flex-direction:column; gap:10px; max-height:58vh; overflow-y:auto; margin-bottom:12px; }
+    .msg { padding:10px 14px; border-radius:12px; font-size:14px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+    .msg.user { background:rgba(99,102,241,.18); border:1px solid rgba(99,102,241,.35); align-self:flex-end; max-width:85%; }
+    .msg.asst { background:rgba(255,255,255,.04); border:1px solid var(--border); align-self:flex-start; max-width:95%; }
+    .msg.tool { font-family:'JetBrains Mono',monospace; font-size:12px; color:#34d399; background:rgba(16,185,129,.08); border:1px solid rgba(16,185,129,.25); }
+    .badge { font-size:12px; padding:4px 10px; border-radius:20px; background:rgba(16,185,129,.12); color:#34d399; border:1px solid rgba(16,185,129,.3); font-weight:700; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div style="font-weight:800;font-size:18px">Zarnkina <span style="color:#a5b4fc;font-size:13px">Remote Control</span></div>
+      <span id="status-badge" class="badge" style="display:none">● Connected</span>
+    </div>
+
+    <div id="pair-card" class="card">
+      <h2 style="font-size:18px;margin-bottom:6px">Connect to Your PC</h2>
+      <p style="color:var(--muted);font-size:13px;margin-bottom:16px">Enter the 6-digit code shown in the Remote Control panel of your Zarnkina Desktop app.</p>
+      <form id="pair-form" style="display:flex;flex-direction:column;gap:12px">
+        <input id="code-input" class="code-in" maxlength="6" placeholder="000000" inputmode="numeric" required>
+        <button type="submit" class="btn">Pair</button>
+        <div id="pair-err" style="color:#f87171;font-size:13px;display:none"></div>
+      </form>
+    </div>
+
+    <div id="chat-card" class="card" style="display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <div style="font-size:13px;color:var(--muted)">Target PC: <b id="host-lbl" style="color:#fff">Zarnkina PC</b></div>
+        <button id="disconnect-btn" class="btn ghost" style="padding:6px 12px;font-size:12px">Disconnect</button>
+      </div>
+      <div id="log"></div>
+      <form id="cmd-form" style="display:flex;gap:8px">
+        <input id="cmd-input" placeholder="Send a task to the desktop agent..." required>
+        <button type="submit" class="btn">Send</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    let browserId = localStorage.getItem('zrk_remote_bid') || '';
+    let sinceTs = 0;
+    let pollTimer = null;
+    let activeAsst = null;
+
+    function addBubble(cls, text) {
+      const box = document.getElementById('log');
+      const div = document.createElement('div');
+      div.className = 'msg ' + cls;
+      div.textContent = text;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+      return div;
+    }
+
+    function showConnected(hostLabel) {
+      document.getElementById('pair-card').style.display = 'none';
+      document.getElementById('chat-card').style.display = 'block';
+      document.getElementById('status-badge').style.display = 'inline-block';
+      if (hostLabel) document.getElementById('host-lbl').textContent = hostLabel;
+      startPolling();
+    }
+
+    function showDisconnected() {
+      if (pollTimer) clearInterval(pollTimer);
+      browserId = '';
+      localStorage.removeItem('zrk_remote_bid');
+      document.getElementById('pair-card').style.display = 'block';
+      document.getElementById('chat-card').style.display = 'none';
+      document.getElementById('status-badge').style.display = 'none';
+    }
+
+    async function pollEvents() {
+      if (!browserId) return;
+      try {
+        const res = await fetch(`/api/remote/stream?browserId=${encodeURIComponent(browserId)}&since=${sinceTs}`);
+        if (res.status === 401) {
+          showDisconnected();
+          return;
+        }
+        const data = await res.json();
+        if (!data.ok) return;
+        sinceTs = data.latestTs || sinceTs;
+        for (const ev of (data.events || [])) {
+          if (ev.t === 'text') {
+            if (!activeAsst) activeAsst = addBubble('asst', '');
+            activeAsst.textContent += (ev.delta || '');
+          } else if (ev.t === 'tool-start') {
+            activeAsst = null;
+            addBubble('tool', `⚙ ${ev.name}: ${ev.args?.target || ev.args?.command || ''}`);
+          } else if (ev.t === 'tool-done') {
+            addBubble('tool', `${ev.ok ? '✓' : '✕'} ${ev.summary || ev.name}`);
+          } else if (ev.t === 'done') {
+            activeAsst = null;
+          }
+          const log = document.getElementById('log');
+          log.scrollTop = log.scrollHeight;
+        }
+      } catch {}
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollEvents();
+      pollTimer = setInterval(pollEvents, 1200);
+    }
+
+    document.getElementById('pair-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const errEl = document.getElementById('pair-err');
+      errEl.style.display = 'none';
+      const code = document.getElementById('code-input').value.trim();
+      const res = await fetch('/api/remote/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        errEl.textContent = data.error || 'Pairing failed.';
+        errEl.style.display = 'block';
+        return;
+      }
+      browserId = data.browserId;
+      localStorage.setItem('zrk_remote_bid', browserId);
+      showConnected(data.hostLabel);
+    });
+
+    document.getElementById('cmd-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const inp = document.getElementById('cmd-input');
+      const text = inp.value.trim();
+      if (!text || !browserId) return;
+      inp.value = '';
+      addBubble('user', text);
+      activeAsst = null;
+      const res = await fetch('/api/remote/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ browserId, text }),
+      });
+      if (res.status === 401) showDisconnected();
+    });
+
+    document.getElementById('disconnect-btn').addEventListener('click', showDisconnected);
+
+    if (browserId) {
+      fetch(`/api/remote/stream?browserId=${encodeURIComponent(browserId)}&since=0`)
+        .then(r => r.ok ? showConnected('Zarnkina PC') : showDisconnected())
+        .catch(showDisconnected);
+    }
+  </script>
+</body>
+</html>
