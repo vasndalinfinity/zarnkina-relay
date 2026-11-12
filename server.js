@@ -390,10 +390,7 @@ app.post('/api/client/verify', rateLimit({ windowMs: 60_000, max: 30, key: 'veri
     error: errMsg || undefined,
     // A bare email claim is not proof of identity, so no session token is
     // issued here unless the deployment opted into email-only auth.
-    sessionToken:
-    allowed && settings.allowEmailAuth === true
-      ? signSessionToken(user.email, req.headers['x-zarnkina-device'] || '')
-      : undefined,
+    sessionToken: undefined,
     user: { email: user.email, whitelisted: user.whitelisted, pro: user.pro, status: user.status, quotaResetAt: Number(user.quotaResetAt || 0) },
     models: store.getPublicModels(),
   });
@@ -815,13 +812,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     owner = store.findUserByEmail(sessionEmail);
     if (!owner) {
       return res.status(403).json({ error: { message: 'Account not found', type: 'invalid_auth' } });
-    }
-  } else if (claimedEmail && settings.allowEmailAuth === true) {
-    owner = store.findUserByEmail(claimedEmail);
-    if (!owner) {
-      return res.status(403).json({
-        error: { message: `Account '${claimedEmail}' is not whitelisted. Access denied.`, type: 'not_whitelisted' },
-      });
     }
   } else if (settings.requireApiKey) {
     return res.status(401).json({ error: { message: 'Valid Zarnkina API key (zk_live_...) is required', type: 'invalid_auth' } });
