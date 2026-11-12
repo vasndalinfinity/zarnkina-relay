@@ -450,6 +450,8 @@ app.post('/api/admin/logout', (_req, res) => {
 app.get('/api/admin/clusters', requireAdmin, (_req, res) => {
   res.json({
     ok: true,
+    ready: routes.ready(),
+    error: routes.ready() ? undefined : routes.error(),
     clusters: routes.clusterIds().map((id) => ({ id, label: routes.clusterLabel(id) })),
   });
 });
