@@ -97,7 +97,15 @@ function requireAdmin(req, res, next) {
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/health-json', (_req, res) => res.json(getMetricsJson()));
-app.get('/health', (_req, res) => res.json({ status: 'ok', active_nodes: store.getTotalActivePoolKeys() }));
+app.get('/health', (_req, res) =>
+  res.json({
+    status: 'ok',
+    active_nodes: store.getTotalActivePoolKeys(),
+    models: store.listModels().length,
+    catalog_version: store.state.catalogVersion || 0,
+    routes_ready: routes.ready(),
+  })
+);
 
 app.get('/', (req, res) => {
   if (req.accepts('html')) {
