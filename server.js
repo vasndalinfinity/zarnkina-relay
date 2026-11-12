@@ -13,9 +13,33 @@ const {
   normalizeEmail,
   signSessionToken,
   verifySessionToken,
+  verifySessionDevice,
 } = require('./lib/auth');
 
 const app = express();
+
+// Naive in-memory buckets: enough to stop scripted probing of the account
+// oracle and the admin password.
+const rateBuckets = new Map();
+function rateLimit({ windowMs, max, key = 'default' }) {
+  return (req, res, next) => {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    const bucketKey = key + ':' + ip;
+    const now = Date.now();
+    const bucket = rateBuckets.get(bucketKey) || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    rateBuckets.set(bucketKey, bucket);
+    if (bucket.count > max) {
+      res.setHeader('Retry-After', Math.ceil((bucket.resetAt - now) / 1000));
+      return res.status(429).json({ ok: false, error: 'Too many requests, slow down.' });
+    }
+    next();
+  };
+}
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
@@ -299,7 +323,7 @@ app.get('/api/remote/stream', (req, res) => {
 });
 
 // Client verification endpoint (for desktop/web whitelist + pro + account status checks)
-app.post('/api/client/verify', (req, res) => {
+app.post('/api/client/verify', rateLimit({ windowMs: 60_000, max: 30, key: 'verify' }), (req, res) => {
   const settings = store.getSettings();
   const auth = req.headers.authorization || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
@@ -318,7 +342,7 @@ app.post('/api/client/verify', (req, res) => {
     return res.json({
       ok: true,
       allowed: true,
-      sessionToken: signSessionToken(owner.email),
+      sessionToken: signSessionToken(owner.email, req.headers['x-zarnkina-device'] || ''),
       user: { email: owner.email, whitelisted: owner.whitelisted, pro: owner.pro, status: owner.status, quotaResetAt: Number(owner.quotaResetAt || 0) },
       models: store.getPublicModels(),
     });
@@ -366,7 +390,10 @@ app.post('/api/client/verify', (req, res) => {
     error: errMsg || undefined,
     // A bare email claim is not proof of identity, so no session token is
     // issued here unless the deployment opted into email-only auth.
-    sessionToken: allowed && settings.allowEmailAuth === true ? signSessionToken(user.email) : undefined,
+    sessionToken:
+    allowed && settings.allowEmailAuth === true
+      ? signSessionToken(user.email, req.headers['x-zarnkina-device'] || '')
+      : undefined,
     user: { email: user.email, whitelisted: user.whitelisted, pro: user.pro, status: user.status, quotaResetAt: Number(user.quotaResetAt || 0) },
     models: store.getPublicModels(),
   });
@@ -378,6 +405,7 @@ app.post('/api/client/google-token', async (req, res) => {
   const clientId = String(process.env.GOOGLE_CLIENT_ID || req.body?.clientId || '').trim();
   const code = String(req.body?.code || '').trim();
   const redirectUri = String(req.body?.redirectUri || 'http://127.0.0.1:8765').trim();
+  const codeVerifier = String(req.body?.codeVerifier || '').trim();
   if (!secret || !clientId) {
     return res.status(501).json({ ok: false, error: 'Sign-in is not configured on this relay.' });
   }
@@ -418,7 +446,10 @@ app.post('/api/client/google-token', async (req, res) => {
       whitelisted: Boolean(user && user.whitelisted),
       pro: Boolean(user && user.pro),
       status: user ? user.status : 'unregistered',
-      sessionToken: user && user.whitelisted && user.status === 'active' ? signSessionToken(email) : undefined,
+      sessionToken:
+        user && user.whitelisted && user.status === 'active'
+          ? signSessionToken(email, req.headers['x-zarnkina-device'] || '')
+          : undefined,
     });
   } catch (error) {
     return res.status(502).json({ ok: false, error: `Google sign-in unreachable: ${error.message}` });
@@ -430,7 +461,7 @@ app.get('/api/admin/session', (req, res) => {
   res.json({ ok: true, authenticated: isAdminRequest(req) });
 });
 
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', rateLimit({ windowMs: 600_000, max: 8, key: 'adminlogin' }), (req, res) => {
   const secret = String(req.body?.secret || '');
   if (!verifyAdminSecret(secret)) {
     return res.status(401).json({ ok: false, error: 'Hatali yonetici sifresi.' });
