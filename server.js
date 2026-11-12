@@ -300,6 +300,7 @@ app.get('/api/remote/stream', (req, res) => {
 
 // Client verification endpoint (for desktop/web whitelist + pro + account status checks)
 app.post('/api/client/verify', (req, res) => {
+  const settings = store.getSettings();
   const auth = req.headers.authorization || '';
   const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
   const bodyKey = String(req.body?.apiKey || '').trim();
