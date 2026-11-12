@@ -669,6 +669,60 @@ function resolveUpstreams(askedModel, modelEntry) {
   return candidates;
 }
 
+// ---- Response scrubbing -------------------------------------------------
+// Upstream chunks and JSON bodies carry the provider's own model id (for
+// example "deepseek-ai/DeepSeek-V4.1-Flash-1017" or "zai-org/GLM-5.3-Flash").
+// Piping them through would tell any client exactly which upstream answers.
+// Every response is rewritten to the public model id the caller asked for.
+
+function scrubJsonPayload(payload, askedModel) {
+  if (!payload || typeof payload !== 'object') return payload;
+  payload.model = askedModel;
+  if ('system_fingerprint' in payload) delete payload.system_fingerprint;
+  return payload;
+}
+
+function scrubSseEvent(event, askedModel) {
+  return event
+    .split('\n')
+    .map((line) => {
+      if (!line.startsWith('data:')) return line;
+      const body = line.slice(5).trim();
+      if (!body || body === '[DONE]') return line;
+      try {
+        return 'data: ' + JSON.stringify(scrubJsonPayload(JSON.parse(body), askedModel));
+      } catch {
+        return line;
+      }
+    })
+    .join('\n');
+}
+
+// SSE events can be split across TCP reads, so hold the tail until the blank
+// line that ends the event arrives.
+function createSseScrubber(askedModel) {
+  let buffer = '';
+  return {
+    push(text) {
+      buffer += text;
+      let out = '';
+      let index;
+      while ((index = buffer.indexOf('\n\n')) >= 0) {
+        const event = buffer.slice(0, index);
+        buffer = buffer.slice(index + 2);
+        out += scrubSseEvent(event, askedModel) + '\n\n';
+      }
+      return out;
+    },
+    flush() {
+      const tail = buffer;
+      buffer = '';
+      if (!tail.trim()) return '';
+      return scrubSseEvent(tail, askedModel);
+    },
+  };
+}
+
 // Chat completions endpoint: key or signed session token, whitelist, pro,
 // freeze/close, model status, then cluster failover from the host table.
 app.post('/v1/chat/completions', async (req, res) => {
