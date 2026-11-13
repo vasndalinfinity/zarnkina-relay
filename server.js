@@ -671,6 +671,7 @@ function pushClusterRoutes(candidates, clusterId, targetModel) {
       url: `${base}/chat/completions`,
       headers: { Authorization: `Bearer ${key}` },
       targetModel,
+      poolKey: key,
     });
   }
 }
@@ -698,6 +699,7 @@ function resolveUpstreams(askedModel, modelEntry) {
         url: `${backup.url}/chat/completions`,
         headers: { Authorization: `Bearer ${key}` },
         targetModel: target,
+        poolKey: key,
       });
     }
   }
@@ -941,6 +943,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
       lastStatus = upstreamRes.status;
+      if (upstreamRes.status === 429 || upstreamRes.status === 402) {
+        if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'daily');
+      } else if (upstreamRes.ok && route.poolKey) {
+        store.clearPoolCooldown(route.poolKey);
+      }
     } catch (err) {
       clearTimeout(timer);
       lastStatus = 502;
