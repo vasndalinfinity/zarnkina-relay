@@ -766,6 +766,11 @@ function createSseScrubber(askedModel) {
 app.post('/v1/chat/completions', async (req, res) => {
   totalRequests++;
   const settings = store.getSettings();
+  if (settings.chatEnabled === false) {
+    return res.status(503).json({
+      error: { message: 'This gateway is currently closed.', type: 'gateway_disabled' },
+    });
+  }
   // Fail closed: without a host routing table this node must not invent an
   // upstream out of hardcoded defaults.
   if (!routes.ready()) {
