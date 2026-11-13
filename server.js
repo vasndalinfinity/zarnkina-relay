@@ -897,7 +897,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60000);
     try {
-      const routeMaxTokens = route.url.includes('pollinations')
+      const routeMaxTokens = !route.supportsTools
         ? Math.min(max_tokens ?? 8192, 16000)
         : (max_tokens ?? defaultOutTokens);
       const upstreamPayload = {
@@ -908,9 +908,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         max_tokens: routeMaxTokens,
       };
       if (reasoning_effort !== undefined) upstreamPayload.reasoning_effort = reasoning_effort;
-      if (tools !== undefined && !route.url.includes('pollinations')) upstreamPayload.tools = tools;
-      if (tool_choice !== undefined && !route.url.includes('pollinations')) upstreamPayload.tool_choice = tool_choice;
-      if (parallel_tool_calls !== undefined && !route.url.includes('pollinations')) upstreamPayload.parallel_tool_calls = parallel_tool_calls;
+      if (tools !== undefined && route.supportsTools) upstreamPayload.tools = tools;
+      if (tool_choice !== undefined && route.supportsTools) upstreamPayload.tool_choice = tool_choice;
+      if (parallel_tool_calls !== undefined && route.supportsTools) upstreamPayload.parallel_tool_calls = parallel_tool_calls;
       if (response_format !== undefined) upstreamPayload.response_format = response_format;
       if (stop !== undefined) upstreamPayload.stop = stop;
       if (top_p !== undefined) upstreamPayload.top_p = top_p;
