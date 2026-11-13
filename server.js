@@ -343,6 +343,14 @@ app.post('/api/client/verify', rateLimit({ windowMs: 60_000, max: 30, key: 'veri
       ok: true,
       allowed: true,
       sessionToken: signSessionToken(owner.email, req.headers['x-zarnkina-device'] || ''),
+      keyQuota: keyRec
+        ? {
+            fiveHourTokens: Number(keyRec.fiveHourTokens) || 0,
+            fiveHourResetAt: Number(keyRec.fiveHourResetAt) || 0,
+            weeklyTokens: Number(keyRec.weeklyTokens) || 0,
+            weeklyResetAt: Number(keyRec.weeklyResetAt) || 0,
+          }
+        : undefined,
       user: { email: owner.email, whitelisted: owner.whitelisted, pro: owner.pro, status: owner.status, quotaResetAt: Number(owner.quotaResetAt || 0) },
       models: store.getPublicModels(),
     });
@@ -832,6 +840,23 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
   if (!owner.whitelisted) {
     return res.status(403).json({ error: { message: 'Account is not whitelisted', type: 'not_whitelisted' } });
+  }
+
+  // 1b. Per-key quota window (5h + weekly), when limits are configured.
+  if (keyRec) {
+    const quota = store.keyQuota(keyRec);
+    if (!quota.ok) {
+      const minutes = Math.max(0, Math.ceil((quota.resetsAt - Date.now()) / 60000));
+      return res.status(429).json({
+        error: {
+          message:
+            quota.reason === 'weekly_limit'
+              ? `Weekly key limit reached; resets in ${Math.ceil(minutes / 60)}h`
+              : `5-hour key limit reached; resets in ${minutes}m`,
+          type: 'quota_exceeded',
+        },
+      });
+    }
   }
 
   // 2. Check model catalog status & Pro privilege
