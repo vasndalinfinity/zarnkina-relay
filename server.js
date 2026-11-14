@@ -425,6 +425,9 @@ app.post('/api/client/google-token', async (req, res) => {
       redirect_uri: redirectUri,
       grant_type: 'authorization_code',
     });
+    // The client sends a PKCE challenge, so Google refuses the exchange unless
+    // the matching verifier comes back with the code.
+    if (codeVerifier) form.set('code_verifier', codeVerifier);
     const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
