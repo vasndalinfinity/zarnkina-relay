@@ -886,6 +886,22 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
   }
 
+  // 2b. Unknown model ids fail closed with a clean error. Guessing a route for
+  // an id the operator never published would let anyone reach an upstream
+  // model that is not in the catalogue, so the request dies here.
+  const knownRoute =
+    (modelEntry && modelEntry.routeCluster && routes.clusterUrl(modelEntry.routeCluster)) ||
+    routes.modelRoute(askedModel) ||
+    routes.fallbackRoute(askedModel);
+  if (!knownRoute) {
+    return res.status(404).json({
+      error: {
+        message: `Unknown model '${askedModel}'. Fetch GET /api/public/models for the available list.`,
+        type: 'model_not_found',
+      },
+    });
+  }
+
   req.setTimeout(0);
   res.setTimeout(0);
 
