@@ -680,9 +680,14 @@ function resolveUpstreams(askedModel, modelEntry) {
   const candidates = [];
   const asked = String(askedModel || '').toLowerCase();
 
+  const tableRoute = routes.modelRoute(askedModel);
   const route = (modelEntry && modelEntry.routeCluster && routes.clusterUrl(modelEntry.routeCluster)
-    ? { cluster: modelEntry.routeCluster, upstream: modelEntry.upstreamModel || askedModel, alt: [] }
-    : (routes.modelRoute(askedModel) || routes.fallbackRoute(askedModel)));
+    ? {
+        cluster: modelEntry.routeCluster,
+        upstream: modelEntry.upstreamModel || askedModel,
+        alt: tableRoute && tableRoute.cluster === modelEntry.routeCluster ? tableRoute.alt : [],
+      }
+    : (tableRoute || routes.fallbackRoute(askedModel)));
 
   if (route && routes.clusterUrl(route.cluster)) {
     pushClusterRoutes(candidates, route.cluster, route.upstream || askedModel);
@@ -1034,7 +1039,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         tokens: approxTokens,
       });
     } else {
-      const data = chosenJsonData;
+      const data = scrubJsonPayload(chosenJsonData, askedModel);
       const usedTokens = data.usage?.total_tokens || 50;
       totalTokens += usedTokens;
       if (keyRec) store.touchApiKey(keyRec.id, owner?.id, usedTokens);
