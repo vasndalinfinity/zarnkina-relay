@@ -457,7 +457,7 @@ app.post('/api/client/google-token', async (req, res) => {
           : undefined,
     });
   } catch (error) {
-    return res.status(502).json({ ok: false, error: `Google sign-in unreachable: ${error.message}` });
+    return res.status(503).json({ ok: false, error: `Google sign-in unreachable: ${error.message}` });
   }
 });
 
@@ -971,7 +971,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
       lastStatus = upstreamRes.status;
-      if (upstreamRes.status === 429 || upstreamRes.status === 402) {
+      if (upstreamRes.status === 429) {
+        // A per-minute limit is not a dead wallet. Parking the key until
+        // midnight would take the whole pool out of service for a day.
+        if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'rate', 60 * 1000);
+      } else if (upstreamRes.status === 402) {
         if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'daily');
       } else if (upstreamRes.ok && route.poolKey) {
         store.clearPoolCooldown(route.poolKey);
@@ -992,7 +996,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       tokens: 0,
     });
     if (!res.headersSent) {
-      return res.status(lastStatus).json({
+      // 502 is swallowed by the edge and replaced with its own HTML page, so
+      // a failed upstream is reported as 503 (or 429 for a rate limit) and the
+      // JSON body reaches the client.
+      const failStatus = lastStatus === 429 ? 429 : 503;
+      return res.status(failStatus).json({
         error: { message: `Gateway upstream error (HTTP ${lastStatus})`, type: 'upstream_error' },
       });
     }
@@ -1074,7 +1082,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (hb) clearInterval(hb);
     console.error('Relay stream error:', err && err.message ? err.message : err);
     if (!res.headersSent) {
-      res.status(502).json({ error: { message: 'Relay gateway connection failed', type: 'gateway_error' } });
+      res.status(503).json({ error: { message: 'Relay gateway connection failed', type: 'gateway_error' } });
     } else if (!res.writableEnded) {
       try {
         res.write(`data: ${JSON.stringify({ error: { message: 'Upstream stream interrupted' } })}\n\n`);
