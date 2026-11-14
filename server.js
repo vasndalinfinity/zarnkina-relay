@@ -681,13 +681,16 @@ function resolveUpstreams(askedModel, modelEntry) {
   const asked = String(askedModel || '').toLowerCase();
 
   const tableRoute = routes.modelRoute(askedModel);
+  // The catalogue is the only source of truth for what may be served. The
+  // substring fallback table exists to route a published id whose cluster
+  // entry is missing, never to guess a route for an id nobody published.
   const route = (modelEntry && modelEntry.routeCluster && routes.clusterUrl(modelEntry.routeCluster)
     ? {
         cluster: modelEntry.routeCluster,
         upstream: modelEntry.upstreamModel || askedModel,
         alt: tableRoute && tableRoute.cluster === modelEntry.routeCluster ? tableRoute.alt : [],
       }
-    : (tableRoute || routes.fallbackRoute(askedModel)));
+    : (tableRoute || (modelEntry ? routes.fallbackRoute(askedModel) : null)));
 
   if (route && routes.clusterUrl(route.cluster)) {
     pushClusterRoutes(candidates, route.cluster, route.upstream || askedModel);
@@ -697,7 +700,7 @@ function resolveUpstreams(askedModel, modelEntry) {
   }
 
   const backup = routes.backup();
-  if (backup && backup.match.some((needle) => asked.includes(String(needle).toLowerCase()))) {
+  if (modelEntry && backup && backup.match.some((needle) => asked.includes(String(needle).toLowerCase()))) {
     const target = backup.upstream || askedModel;
     for (const key of getNextBackupKeys(backup.pool, 4)) {
       candidates.push({
@@ -891,8 +894,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   // model that is not in the catalogue, so the request dies here.
   const knownRoute =
     (modelEntry && modelEntry.routeCluster && routes.clusterUrl(modelEntry.routeCluster)) ||
-    routes.modelRoute(askedModel) ||
-    routes.fallbackRoute(askedModel);
+    routes.modelRoute(askedModel);
   if (!knownRoute) {
     return res.status(404).json({
       error: {
