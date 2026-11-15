@@ -467,6 +467,54 @@ app.post('/api/client/google-token', async (req, res) => {
   }
 });
 
+// Per-key quota telemetry for the desktop status bar: 5h and weekly usage in
+// absolute tokens and percent, plus the next reset time.
+app.get('/api/client/quota', (req, res) => {
+  const auth = String(req.headers['authorization'] || '').trim();
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = String(req.headers['x-zarnkina-token'] || '').trim();
+  let keyRec = null;
+  let sessionOwner = null;
+  if (bearer && bearer.startsWith('zk_live_')) {
+    keyRec = store.findApiKeyByPlain(bearer);
+    if (!keyRec || !keyRec.active) {
+      return res.status(401).json({ ok: false, error: 'Invalid or disabled API key.' });
+    }
+  } else {
+    const sessionEmail = verifySessionToken(headerToken || (bearer.startsWith('zk_sess_') ? bearer : ''));
+    if (!sessionEmail) {
+      return res.status(401).json({ ok: false, error: 'Authentication required.' });
+    }
+    const owner = store.findUserByEmail(sessionEmail);
+    if (!owner) {
+      return res.status(403).json({ ok: false, error: 'Account not found.' });
+    }
+    sessionOwner = owner;
+  }
+  const fiveLimit = Number(process.env.KEY_5H_TOKENS) || 0;
+  const weekLimit = Number(process.env.KEY_WEEK_TOKENS) || 0;
+  const record = sessionOwner || keyRec;
+  const quota = record ? (sessionOwner ? store.userQuota(record) : store.keyQuota(record)) : { ok: true };
+  const percent = (used, limit) => (limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0);
+  res.json({
+    ok: true,
+    allowed: quota.ok,
+    reason: quota.reason || '',
+    fiveHour: {
+      used: record ? Number(record.fiveHourTokens) || 0 : 0,
+      limit: fiveLimit,
+      pct: record ? percent(Number(record.fiveHourTokens) || 0, fiveLimit) : 0,
+      resetsAt: record ? Number(record.fiveHourResetAt) || 0 : 0,
+    },
+    weekly: {
+      used: record ? Number(record.weeklyTokens) || 0 : 0,
+      limit: weekLimit,
+      pct: record ? percent(Number(record.weeklyTokens) || 0, weekLimit) : 0,
+      resetsAt: record ? Number(record.weeklyResetAt) || 0 : 0,
+    },
+  });
+});
+
 // ---- Admin Authentication ----
 app.get('/api/admin/session', (req, res) => {
   res.json({ ok: true, authenticated: isAdminRequest(req) });
@@ -876,6 +924,24 @@ app.post('/v1/chat/completions', async (req, res) => {
             quota.reason === 'weekly_limit'
               ? `Weekly key limit reached; resets in ${Math.ceil(minutes / 60)}h`
               : `5-hour key limit reached; resets in ${minutes}m`,
+          type: 'quota_exceeded',
+        },
+      });
+    }
+  }
+
+  // 1c. Sessions have no API key; their 5h/weekly usage is tracked on the
+  // account record instead.
+  if (owner && !keyRec) {
+    const userQuota = store.userQuota(owner);
+    if (!userQuota.ok) {
+      const minutes = Math.max(0, Math.ceil((userQuota.resetsAt - Date.now()) / 60000));
+      return res.status(429).json({
+        error: {
+          message:
+            userQuota.reason === 'weekly_limit'
+              ? `Weekly account limit reached; resets in ${Math.ceil(minutes / 60)}h`
+              : `5-hour account limit reached; resets in ${minutes}m`,
           type: 'quota_exceeded',
         },
       });
