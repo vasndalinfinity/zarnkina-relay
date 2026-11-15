@@ -44,8 +44,6 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 8080;
-// Reasoning models need room for the answer after they finish thinking.
-const MIN_REASONING_TOKENS = 2048;
 const store = new Store();
 
 process.on('uncaughtException', (err) => {
@@ -730,26 +728,6 @@ function scrubJsonPayload(payload, askedModel) {
   if (!payload || typeof payload !== 'object') return payload;
   payload.model = askedModel;
   if ('system_fingerprint' in payload) delete payload.system_fingerprint;
-  // A reasoning model that spent its whole token budget on reasoning_content
-  // leaves the client with an empty message. Promote the reasoning so the
-  // answer is not lost.
-  const choices = Array.isArray(payload.choices) ? payload.choices : [];
-  for (const choice of choices) {
-    const msg = choice && choice.message;
-    if (!msg || typeof msg !== 'object') continue;
-    const answer = typeof msg.content === 'string' ? msg.content : '';
-    const reasoning =
-      typeof msg.reasoning_content === 'string'
-        ? msg.reasoning_content
-        : typeof msg.reasoning === 'string'
-          ? msg.reasoning
-          : '';
-    if (!answer.trim() && reasoning.trim()) {
-      msg.content = reasoning;
-      msg.reasoning_content = '';
-      msg.reasoning = '';
-    }
-  }
   return payload;
 }
 
@@ -948,16 +926,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       const routeMaxTokens = !route.supportsTools
         ? Math.min(max_tokens ?? 8192, 16000)
         : (max_tokens ?? defaultOutTokens);
-      // Reasoning models spend the whole budget on reasoning_content and hit
-      // the cap before the answer starts, which the client sees as an empty
-      // message. Leave room for the answer itself.
-      const tokenFloor = modelEntry && modelEntry.reasoning !== false ? MIN_REASONING_TOKENS : 1;
       const upstreamPayload = {
         model: route.targetModel,
         messages: messages || [],
         stream: Boolean(stream),
         temperature: temperature ?? 0.7,
-        max_tokens: Math.max(routeMaxTokens, tokenFloor),
+        max_tokens: routeMaxTokens,
       };
       if (reasoning_effort !== undefined) upstreamPayload.reasoning_effort = reasoning_effort;
       if (tools !== undefined && route.supportsTools) upstreamPayload.tools = tools;
