@@ -931,7 +931,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       break;
     }
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 60000);
+    // The per-attempt timeout never outlives the overall deadline.
+    const attemptBudget = Math.max(5000, Math.min(60000, resolveDeadline - Date.now()));
+    const timer = setTimeout(() => ac.abort(), attemptBudget);
     try {
       const routeMaxTokens = !route.supportsTools
         ? Math.min(max_tokens ?? 8192, 16000)
