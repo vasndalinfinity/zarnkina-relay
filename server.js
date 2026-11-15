@@ -799,6 +799,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     temperature,
     max_tokens,
     reasoning_effort,
+    enable_thinking,
+    thinking,
     tools,
     tool_choice,
     parallel_tool_calls,
@@ -948,7 +950,20 @@ app.post('/v1/chat/completions', async (req, res) => {
         temperature: temperature ?? 0.7,
         max_tokens: routeMaxTokens,
       };
-      if (reasoning_effort !== undefined) upstreamPayload.reasoning_effort = reasoning_effort;
+      // Clients signal "no reasoning" in three different ways. Every upstream
+      // behind this relay understands reasoning_effort, and a model that skips
+      // its thinking answers in seconds instead of a minute. The other two
+      // spellings are never forwarded: some backends reject unknown fields
+      // with a 400.
+      const clientWantsReasoning =
+        reasoning_effort !== 'none' &&
+        enable_thinking !== false &&
+        !(thinking && thinking.type === 'disabled');
+      if (!clientWantsReasoning) {
+        upstreamPayload.reasoning_effort = 'none';
+      } else if (reasoning_effort !== undefined) {
+        upstreamPayload.reasoning_effort = reasoning_effort;
+      }
       if (tools !== undefined && route.supportsTools) upstreamPayload.tools = tools;
       if (tool_choice !== undefined && route.supportsTools) upstreamPayload.tool_choice = tool_choice;
       if (parallel_tool_calls !== undefined && route.supportsTools) upstreamPayload.parallel_tool_calls = parallel_tool_calls;
