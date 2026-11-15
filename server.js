@@ -919,7 +919,17 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   const defaultOutTokens = Math.min(modelEntry?.maxOutputTokens || 32768, 65536);
 
+  // The edge drops a connection that runs past its own limit and replaces the
+  // body with an HTML error page. Answering with JSON a little earlier is
+  // always better than an unparsable page, so the whole failover walk gets a
+  // deadline of its own.
+  const resolveDeadline = Date.now() + 100000;
+
   for (const route of upstreamRoutes) {
+    if (Date.now() > resolveDeadline) {
+      lastStatus = 504;
+      break;
+    }
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 60000);
     try {
