@@ -44,6 +44,9 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 8080;
+// How long an account may stay silent before the next one is tried. Reasoning
+// models think before they answer, so this is generous on purpose.
+const FIRST_BYTE_TIMEOUT_MS = 25000;
 const store = new Store();
 
 process.on('uncaughtException', (err) => {
@@ -962,15 +965,28 @@ app.post('/v1/chat/completions', async (req, res) => {
         body: JSON.stringify(upstreamPayload),
         signal: ac.signal,
       });
-      clearTimeout(timer);
       if (upstreamRes.ok) {
         if (stream) {
           if (!upstreamRes.body) {
+            clearTimeout(timer);
             lastStatus = 502;
             continue;
           }
           const reader = upstreamRes.body.getReader();
-          const first = await reader.read();
+          // A slow account must not hold the client hostage: if the first
+          // byte does not arrive in time, drop this account and try the next.
+          const first = await Promise.race([
+            reader.read(),
+            new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), FIRST_BYTE_TIMEOUT_MS)),
+          ]);
+          clearTimeout(timer);
+          if (first.timeout) {
+            try {
+              ac.abort();
+            } catch {}
+            lastStatus = 504;
+            continue;
+          }
           if (first.done && (!first.value || first.value.length === 0)) {
             lastStatus = 502;
             continue;
@@ -980,6 +996,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           chosenFirstChunk = first.done ? null : first.value;
           break;
         } else {
+          clearTimeout(timer);
           chosenJsonData = await upstreamRes.json();
           chosenRes = upstreamRes;
           break;
