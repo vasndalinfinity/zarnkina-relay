@@ -1,0 +1,6 @@
+// Per-account 5h/weekly quota limits in tokens. The relay enforces these and
+// the desktop status bar reports the percentages. Edit and redeploy to change.
+{
+  "fiveHour": 1000000,
+  "weekly": 6000000
+}
