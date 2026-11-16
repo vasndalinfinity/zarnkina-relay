@@ -60,6 +60,43 @@ process.on('unhandledRejection', (reason) => {
 // resolved from the host-only routing table (lib/routes.js -> data/routes.json).
 const keyPointers = new Map();
 
+// A free pool throttles the whole network address, not only the accounts that
+// belong to it. Firing several requests at the same pool in parallel burns
+// that shared budget in one go, so every cluster gets a small gate: a number
+// of parallel requests and a minimum spacing between their starts.
+const clusterGates = new Map();
+const CLUSTER_MAX_INFLIGHT = 3;
+const CLUSTER_MIN_SPACING_MS = 1200;
+
+function acquireClusterSlot(clusterId) {
+  const id = String(clusterId || '').trim();
+  if (!id) return Promise.resolve(() => {});
+  const gate = clusterGates.get(id) || { inflight: 0, nextStart: 0 };
+  clusterGates.set(id, gate);
+  return new Promise((resolve) => {
+    const start = () => {
+      gate.inflight += 1;
+      gate.nextStart = Date.now() + CLUSTER_MIN_SPACING_MS;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        gate.inflight = Math.max(0, gate.inflight - 1);
+      });
+    };
+    const wait = () => {
+      if (gate.inflight >= CLUSTER_MAX_INFLIGHT) {
+        setTimeout(wait, 120);
+        return;
+      }
+      const delay = Math.max(0, gate.nextStart - Date.now());
+      if (delay > 0) setTimeout(start, delay);
+      else start();
+    };
+    wait();
+  });
+}
+
 // Failure bodies are short JSON documents. These helpers read the reason out
 // of them so the relay can park the right scope: one key, one model, or the
 // whole cluster when the egress address itself is throttled.
@@ -108,16 +145,24 @@ function nextPointer(clusterId) {
   return current;
 }
 
+// The window is filled in two tiers: accounts that already answered for this
+// model first (they rotate among themselves so one key does not carry the
+// whole load), then the accounts whose entitlement is still unknown. A free
+// catalogue rotates its models behind the keys, so a wide window matters:
+// the first request after a deploy has to find a working account.
 function getNextKeys(clusterId, maxCount = 6, model = '') {
   const groups = store.getActivePoolKeyGroups(clusterId, model);
-  const pool = groups.preferred.concat(groups.others);
-  if (!pool.length) return [];
-  const count = Math.min(pool.length, maxCount);
-  const start = nextPointer(clusterId) % pool.length;
   const out = [];
-  for (let i = 0; i < count; i++) {
-    out.push(pool[(start + i) % pool.length]);
-  }
+  const takeFrom = (list, wanted) => {
+    if (!list.length || out.length >= maxCount) return;
+    const start = nextPointer(`${clusterId}:${list.length}:${wanted}`) % list.length;
+    for (let i = 0; i < list.length && out.length < maxCount; i++) {
+      const key = list[(start + i) % list.length];
+      if (!out.includes(key)) out.push(key);
+    }
+  };
+  takeFrom(groups.preferred, 'p');
+  takeFrom(groups.others, 'o');
   return out;
 }
 
@@ -768,7 +813,7 @@ app.get('/v1/models', (_req, res) => {
 function pushClusterRoutes(candidates, clusterId, targetModel) {
   const base = routes.clusterUrl(clusterId);
   if (!base) return;
-  const keys = getNextKeys(clusterId, 8, targetModel);
+  const keys = getNextKeys(clusterId, 16, targetModel);
   if (!keys.length) return;
   // The capability lives in the routing table, so the upstream that cannot
   // take tool definitions never receives them.
@@ -782,6 +827,42 @@ function pushClusterRoutes(candidates, clusterId, targetModel) {
       clusterId,
       supportsTools: canTools,
     });
+  }
+}
+
+// A free catalogue can rotate the models behind its keys: the same account
+// may carry one alias now and a different one an hour later. When the pool
+// answers "model not available" for every candidate, the other free aliases
+// of the same pool are tried before the client sees an error.
+const FREE_ALIAS_SWAP = {
+  'deepseek-v4.1-flash:free': ['deepseek-v4-flash:free'],
+  'deepseek-v4-flash:free': ['deepseek-v4.1-flash:free'],
+};
+
+function pushAliasFallbackRoutes(candidates, clusterId, targetModel) {
+  const aliases = FREE_ALIAS_SWAP[targetModel];
+  if (!aliases) return;
+  const base = routes.clusterUrl(clusterId);
+  if (!base) return;
+  const canTools = routes.supportsTools(clusterId);
+  for (const alias of aliases) {
+    const keys = getNextKeys(clusterId, 8, alias);
+    if (!keys.length) continue;
+    for (const key of keys) {
+      const url = `${base}/chat/completions`;
+      // One candidate per account: a pool of 29 keys must not turn into 29
+      // copies of the same account in the failover walk.
+      if (candidates.some((c) => c.url === url && c.poolKey === key && c.targetModel === alias)) continue;
+      candidates.push({
+        url,
+        headers: { Authorization: `Bearer ${key}` },
+        targetModel: alias,
+        poolKey: key,
+        clusterId,
+        supportsTools: canTools,
+        aliasFallback: true,
+      });
+    }
   }
 }
 
@@ -806,6 +887,17 @@ function resolveUpstreams(askedModel, modelEntry) {
     for (const alt of route.alt || []) {
       if (alt && alt.cluster) pushClusterRoutes(candidates, alt.cluster, alt.upstream || askedModel);
     }
+  }
+
+  // The other free aliases of the same pool are the last resort: same
+  // quality class, same account pool, no new provider.
+  const aliasTargets = new Set();
+  for (const cand of candidates) {
+    if (!cand.clusterId || !cand.targetModel) continue;
+    const tag = `${cand.clusterId}|${cand.targetModel}`;
+    if (aliasTargets.has(tag)) continue;
+    aliasTargets.add(tag);
+    pushAliasFallbackRoutes(candidates, cand.clusterId, cand.targetModel);
   }
 
   const backup = routes.backup();
@@ -1076,8 +1168,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   // A shared-address limit applies to every account in the pool at once, so
   // walking the rest of the candidates would only collect the same rejection.
   let sharedLimitHit = false;
+  let lastRoute = null;
 
   for (const route of upstreamRoutes) {
+    lastRoute = route;
     if (Date.now() > resolveDeadline) {
       lastStatus = 504;
       break;
@@ -1086,7 +1180,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     // The per-attempt timeout never outlives the overall deadline.
     const attemptBudget = Math.max(5000, Math.min(60000, resolveDeadline - Date.now()));
     const timer = setTimeout(() => ac.abort(), attemptBudget);
+    // The cluster gate is held for the whole attempt so the pool sees one
+    // request at a time and the shared budget lasts.
+    let releaseSlot = () => {};
     try {
+      releaseSlot = await acquireClusterSlot(route.clusterId);
       const routeMaxTokens = !route.supportsTools
         ? Math.min(max_tokens ?? 8192, 16000)
         : (max_tokens ?? defaultOutTokens);
@@ -1197,14 +1295,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       } else if (upstreamRes.status === 402) {
         if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'daily');
       } else if (upstreamRes.status === 404 && isModelUnavailable(failureMessage)) {
-        // The account exists but does not carry this model. Park it for this
-        // model only; the same key may still serve the rest of the catalogue.
-        if (route.poolKey) store.notePoolKeyModelUnavailable(route.poolKey, route.targetModel, 30 * 60 * 1000);
+        // The account exists but does not carry this model right now. The
+        // upstream rotates the catalogue behind the keys, so the park is short:
+        // long enough to skip the key for this burst, short enough that it
+        // comes back into rotation on its own.
+        if (route.poolKey) store.notePoolKeyModelUnavailable(route.poolKey, route.targetModel, 5 * 60 * 1000);
       }
       if (sharedLimitHit) break;
     } catch (err) {
       clearTimeout(timer);
       lastStatus = 502;
+    } finally {
+      releaseSlot();
     }
   }
 
@@ -1222,6 +1324,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       // a failed upstream is reported as 503 (or 429 for a rate limit) and the
       // JSON body reaches the client.
       const failStatus = lastStatus === 429 ? 429 : 503;
+      if (lastStatus === 429) {
+        const clusterId = (lastRoute && lastRoute.clusterId) || (modelEntry && modelEntry.routeCluster) || '';
+        const waitMs = clusterId ? store.getClusterCooldownRemaining(clusterId) : 0;
+        if (waitMs > 0) res.setHeader('Retry-After', String(Math.ceil(waitMs / 1000)));
+      }
       return res.status(failStatus).json({
         error: { message: `Gateway upstream error (HTTP ${lastStatus})`, type: 'upstream_error' },
       });
