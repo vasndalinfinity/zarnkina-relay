@@ -56,9 +56,51 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled rejection (kept alive):', reason);
 });
 
-// Upstream endpoints are not in this file. Anything downstream of auth is
+// The upstream endpoints are not in this file. Anything downstream of auth is
 // resolved from the host-only routing table (lib/routes.js -> data/routes.json).
 const keyPointers = new Map();
+
+// Failure bodies are short JSON documents. These helpers read the reason out
+// of them so the relay can park the right scope: one key, one model, or the
+// whole cluster when the egress address itself is throttled.
+function extractUpstreamMessage(bodyText) {
+  const raw = String(bodyText || '');
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    return String(parsed?.error?.message || parsed?.message || '').trim();
+  } catch {
+    return raw.slice(0, 300).trim();
+  }
+}
+
+function isSharedAddressLimit(message) {
+  return /sharing this network address|shared (?:ip|address)|many .* accounts/i.test(String(message || ''));
+}
+
+function isModelUnavailable(message) {
+  return /is not available|model_unavailable|not found|unknown model/i.test(String(message || ''));
+}
+
+// "You can send your next request in 59 min 1 s." and "try again in 14s" both
+// carry the real wait. Honouring it beats a fixed one-minute guess.
+function parseRetryWaitMs(message) {
+  const raw = String(message || '');
+  const m = /in\s+((?:\d+\s*(?:min|minute|minutes|m|sec|second|seconds|s|hour|hours|h)\s*)+)/i.exec(raw);
+  if (!m) return 0;
+  let total = 0;
+  const re = /(\d+)\s*(min|minute|minutes|m|sec|second|seconds|s|hour|hours|h)/gi;
+  let hit;
+  while ((hit = re.exec(m[1]))) {
+    const value = Number(hit[1]);
+    const unit = hit[2].toLowerCase();
+    if (unit.startsWith('h')) total += value * 3600 * 1000;
+    else if (unit.startsWith('m')) total += value * 60 * 1000;
+    else total += value * 1000;
+  }
+  // A wait longer than an hour is a daily window, not a rate window.
+  return total > 0 && total <= 6 * 3600 * 1000 ? total : 0;
+}
 
 function nextPointer(clusterId) {
   const current = keyPointers.get(clusterId) || 0;
@@ -66,14 +108,15 @@ function nextPointer(clusterId) {
   return current;
 }
 
-function getNextKeys(clusterId, maxCount = 6) {
-  const keys = store.getActivePoolKeys(clusterId);
-  if (!keys.length) return [];
-  const count = Math.min(keys.length, maxCount);
-  const start = nextPointer(clusterId) % keys.length;
+function getNextKeys(clusterId, maxCount = 6, model = '') {
+  const groups = store.getActivePoolKeyGroups(clusterId, model);
+  const pool = groups.preferred.concat(groups.others);
+  if (!pool.length) return [];
+  const count = Math.min(pool.length, maxCount);
+  const start = nextPointer(clusterId) % pool.length;
   const out = [];
   for (let i = 0; i < count; i++) {
-    out.push(keys[(start + i) % keys.length]);
+    out.push(pool[(start + i) % pool.length]);
   }
   return out;
 }
@@ -725,14 +768,19 @@ app.get('/v1/models', (_req, res) => {
 function pushClusterRoutes(candidates, clusterId, targetModel) {
   const base = routes.clusterUrl(clusterId);
   if (!base) return;
-  const keys = getNextKeys(clusterId, 6);
+  const keys = getNextKeys(clusterId, 8, targetModel);
   if (!keys.length) return;
+  // The capability lives in the routing table, so the upstream that cannot
+  // take tool definitions never receives them.
+  const canTools = routes.supportsTools(clusterId);
   for (const key of keys) {
     candidates.push({
       url: `${base}/chat/completions`,
       headers: { Authorization: `Bearer ${key}` },
       targetModel,
       poolKey: key,
+      clusterId,
+      supportsTools: canTools,
     });
   }
 }
@@ -769,6 +817,7 @@ function resolveUpstreams(askedModel, modelEntry) {
         headers: { Authorization: `Bearer ${key}` },
         targetModel: target,
         poolKey: key,
+        supportsTools: routes.supportsTools(backup.cluster || ''),
       });
     }
   }
@@ -995,6 +1044,27 @@ app.post('/v1/chat/completions', async (req, res) => {
   let chosenJsonData = null;
   let lastStatus = 502;
 
+  // Every account of the pool is parked (a shared address limit or a model
+  // the accounts do not carry). Say so with a retry hint instead of a bare
+  // gateway error, so the client can wait instead of hammering.
+  if (!upstreamRoutes.length) {
+    const clusterId =
+      typeof knownRoute === 'string'
+        ? (modelEntry && modelEntry.routeCluster) || ''
+        : (knownRoute && knownRoute.cluster) || '';
+    const waitMs = clusterId ? store.getClusterCooldownRemaining(clusterId) : 0;
+    if (waitMs > 0) {
+      const seconds = Math.ceil(waitMs / 1000);
+      res.setHeader('Retry-After', String(seconds));
+      return res.status(429).json({
+        error: {
+          message: `Pool temporarily unavailable; retry in ${seconds}s`,
+          type: 'pool_rate_limited',
+        },
+      });
+    }
+  }
+
   const defaultOutTokens = Math.min(modelEntry?.maxOutputTokens || 32768, 65536);
 
   // The edge drops a connection that runs past its own limit and replaces the
@@ -1002,6 +1072,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   // always better than an unparsable page, so the whole failover walk gets a
   // deadline of its own.
   const resolveDeadline = Date.now() + 100000;
+
+  // A shared-address limit applies to every account in the pool at once, so
+  // walking the rest of the candidates would only collect the same rejection.
+  let sharedLimitHit = false;
 
   for (const route of upstreamRoutes) {
     if (Date.now() > resolveDeadline) {
@@ -1054,6 +1128,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         signal: ac.signal,
       });
       if (upstreamRes.ok) {
+        // The account answered, so any parking it carried is over. The
+        // success path breaks out of the loop, so the clear has to happen
+        // here or the key stays parked forever.
+        if (route.poolKey) {
+          store.clearPoolCooldown(route.poolKey);
+          store.clearPoolKeyModelUnavailable(route.poolKey, route.targetModel);
+        }
         if (stream) {
           if (!upstreamRes.body) {
             clearTimeout(timer);
@@ -1091,15 +1172,36 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
       lastStatus = upstreamRes.status;
+      // The failure body carries the reason: which model is missing, how long
+      // the account is parked, and whether the limit is the account or the
+      // shared network address. Reading it is the only way to park the right
+      // scope instead of guessing.
+      let failureText = '';
+      if (!upstreamRes.ok) {
+        try {
+          failureText = (await upstreamRes.text()).slice(0, 2000);
+        } catch {}
+      }
+      const failureMessage = extractUpstreamMessage(failureText);
       if (upstreamRes.status === 429) {
-        // A per-minute limit is not a dead wallet. Parking the key until
-        // midnight would take the whole pool out of service for a day.
-        if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'rate', 60 * 1000);
+        if (isSharedAddressLimit(failureMessage)) {
+          // Every account behind this egress address is throttled together.
+          // Parking the whole cluster stops the relay from walking all of the
+          // keys just to collect the same rejection.
+          if (route.clusterId) store.coolDownCluster(route.clusterId, 60 * 1000, 'shared');
+          sharedLimitHit = true;
+        } else if (route.poolKey) {
+          const waitMs = parseRetryWaitMs(failureMessage);
+          store.coolDownPoolKey(route.poolKey, 'rate', waitMs || 60 * 1000);
+        }
       } else if (upstreamRes.status === 402) {
         if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'daily');
-      } else if (upstreamRes.ok && route.poolKey) {
-        store.clearPoolCooldown(route.poolKey);
+      } else if (upstreamRes.status === 404 && isModelUnavailable(failureMessage)) {
+        // The account exists but does not carry this model. Park it for this
+        // model only; the same key may still serve the rest of the catalogue.
+        if (route.poolKey) store.notePoolKeyModelUnavailable(route.poolKey, route.targetModel, 30 * 60 * 1000);
       }
+      if (sharedLimitHit) break;
     } catch (err) {
       clearTimeout(timer);
       lastStatus = 502;
