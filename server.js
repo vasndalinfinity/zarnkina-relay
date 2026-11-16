@@ -583,7 +583,7 @@ app.get('/api/client/quota', (req, res) => {
   const weekLimit = Number(process.env.KEY_WEEK_TOKENS) || store.getQuotaLimits().weekly;
   const record = sessionOwner || keyRec;
   const quota = record ? (sessionOwner ? store.userQuota(record) : store.keyQuota(record)) : { ok: true };
-  const percent = (used, limit) => (limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0);
+  const percent = (used, limit) => (limit > 0 ? Math.min(100, Math.round((used / limit) * 1000) / 10) : 0);
   res.json({
     ok: true,
     allowed: quota.ok,
