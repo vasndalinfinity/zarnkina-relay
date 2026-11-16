@@ -62,21 +62,21 @@ const keyPointers = new Map();
 
 // A free pool throttles the whole network address, not only the accounts that
 // belong to it. Firing several requests at the same pool in parallel burns
-// that shared budget in one go, so every cluster gets a small gate: a number
-// of parallel requests and a minimum spacing between their starts.
+// that shared budget in one go, so every cluster gets a gate: a number of
+// parallel requests and a minimum spacing between their starts. The values
+// come from the routing table, so paid pools run at full width.
 const clusterGates = new Map();
-const CLUSTER_MAX_INFLIGHT = 3;
-const CLUSTER_MIN_SPACING_MS = 1200;
 
 function acquireClusterSlot(clusterId) {
   const id = String(clusterId || '').trim();
   if (!id) return Promise.resolve(() => {});
+  const limits = routes.gateFor(id);
   const gate = clusterGates.get(id) || { inflight: 0, nextStart: 0 };
   clusterGates.set(id, gate);
   return new Promise((resolve) => {
     const start = () => {
       gate.inflight += 1;
-      gate.nextStart = Date.now() + CLUSTER_MIN_SPACING_MS;
+      gate.nextStart = Date.now() + limits.minSpacingMs;
       let released = false;
       resolve(() => {
         if (released) return;
@@ -85,8 +85,8 @@ function acquireClusterSlot(clusterId) {
       });
     };
     const wait = () => {
-      if (gate.inflight >= CLUSTER_MAX_INFLIGHT) {
-        setTimeout(wait, 120);
+      if (gate.inflight >= limits.maxInflight) {
+        setTimeout(wait, 100);
         return;
       }
       const delay = Math.max(0, gate.nextStart - Date.now());
