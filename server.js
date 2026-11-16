@@ -1386,6 +1386,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (!res.writableEnded) res.end();
 
       if (keyRec) store.touchApiKey(keyRec.id, owner?.id, approxTokens);
+      else if (owner) store.touchUser(owner.id, approxTokens);
       store.recordRequestLog({
         email: logEmail,
         keyPrefix: keyRec ? keyRec.prefix : '—',
@@ -1398,6 +1399,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const usedTokens = data.usage?.total_tokens || 50;
       totalTokens += usedTokens;
       if (keyRec) store.touchApiKey(keyRec.id, owner?.id, usedTokens);
+      else if (owner) store.touchUser(owner.id, usedTokens);
       store.recordRequestLog({
         email: logEmail,
         keyPrefix: keyRec ? keyRec.prefix : '—',
