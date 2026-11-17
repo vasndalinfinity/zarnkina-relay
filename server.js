@@ -226,8 +226,22 @@ app.get('/health', (_req, res) =>
 app.get('/', (_req, res) => res.json(getMetricsJson()));
 
 // Desktop release / auto-update manifest
-app.get('/api/public/release', (_req, res) => {
-  res.json({ ok: true, ...store.getRelease() });
+// Beta channel: the manifest can carry a pre-release next to the stable one.
+app.get('/api/public/release', (req, res) => {
+  const channel = String(req.query.channel || 'stable').toLowerCase();
+  const release = store.getRelease() || {};
+  if (channel === 'beta' && release.betaVersion) {
+    return res.json({
+      ok: true,
+      version: release.betaVersion,
+      notes: release.betaNotes || release.notes || '',
+      downloadUrl: release.betaDownloadUrl || release.downloadUrl || '',
+      autoUpdate: release.autoUpdate !== false,
+      sha256: release.betaSha256 || '',
+      channel: 'beta',
+    });
+  }
+  res.json({ ok: true, ...release, channel: 'stable' });
 });
 
 // Public model roster (sanitized: never leaks routeCluster/upstreamModel)
