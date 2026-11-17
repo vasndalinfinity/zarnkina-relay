@@ -208,8 +208,9 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// Static assets
-app.use(express.static(path.join(__dirname, 'public')));
+// The public site is gone: this relay serves JSON and the model API only.
+// Status lives at /health and /health-json; the operator panel ships inside
+// the desktop app (it talks to /api/admin/* through a native command).
 
 app.get('/health-json', (_req, res) => res.json(getMetricsJson()));
 app.get('/health', (_req, res) =>
@@ -222,20 +223,7 @@ app.get('/health', (_req, res) =>
   })
 );
 
-app.get('/', (req, res) => {
-  if (req.accepts('html')) {
-    return res.sendFile(path.join(__dirname, 'public', 'index.html'));
-  }
-  res.json(getMetricsJson());
-});
-
-app.get('/admin', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
-
-app.get('/remote', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'remote.html'));
-});
+app.get('/', (_req, res) => res.json(getMetricsJson()));
 
 // Desktop release / auto-update manifest
 app.get('/api/public/release', (_req, res) => {
