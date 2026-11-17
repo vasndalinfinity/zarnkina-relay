@@ -1010,6 +1010,29 @@ app.post('/v1/chat/completions', async (req, res) => {
   } = req.body || {};
   const askedModel = String(model || 'zarnkina-glm-5.3-flash');
 
+  // A text model cannot take an image part: the upstream answers 400 and the
+  // whole turn dies. Flattening the parts keeps the text (and whatever the
+  // caller wrote around the image) usable, and a header tells the client why.
+  const modelForVision = store.findModel(askedModel);
+  const visionEnabled = Boolean(
+    modelForVision && String(modelForVision.inputs || '').includes('image')
+  );
+  let visionDropped = false;
+  const normalizedMessages = Array.isArray(messages)
+    ? messages.map((message) => {
+        if (!message || !Array.isArray(message.content)) return message;
+        if (visionEnabled) return message;
+        const texts = [];
+        for (const part of message.content) {
+          if (!part || typeof part !== 'object') continue;
+          if (part.type === 'text' && part.text) texts.push(String(part.text));
+          else if (part.type === 'image_url') visionDropped = true;
+        }
+        return { ...message, content: texts.join('\n') };
+      })
+    : messages;
+  if (visionDropped) res.setHeader('x-zarnkina-vision', 'dropped');
+
   // 1. Identity: API key, or a signed session token issued by /api/client/verify.
   // A bare email header is a claim, not proof, and is refused unless the
   // deployment explicitly re-enables it.
@@ -1190,7 +1213,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         : (max_tokens ?? defaultOutTokens);
       const upstreamPayload = {
         model: route.targetModel,
-        messages: messages || [],
+        messages: normalizedMessages || [],
         stream: Boolean(stream),
         temperature: temperature ?? 0.7,
         max_tokens: routeMaxTokens,
