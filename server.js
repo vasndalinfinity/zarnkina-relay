@@ -1440,11 +1440,30 @@ app.use((req, res) => {
   res.status(404).json({ error: { message: 'Not found', type: 'not_found', path: req.path } });
 });
 
+// The relay listens first and warms up behind a gate. Postgres and the vault
+// can take a minute on a cold start, and a health check that waits for them is
+// how deployments end up marked failed.
+let booted = false;
+app.use((req, res, next) => {
+  if (booted) return next();
+  if (req.path === '/health' || req.path === '/health-json') return next();
+  res.setHeader('Retry-After', '5');
+  return res.status(503).json({ error: { message: 'Relay is warming up', type: 'warming_up' } });
+});
+
 (async () => {
-  await store.initAsync();  const srv = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Zarnkina Relay listening on port ${PORT} - Active pool keys: ${store.getTotalActivePoolKeys()}`);
+  const srv = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Zarnkina Relay listening on port ${PORT} - warming up`);
   });
   srv.requestTimeout = 0;
   srv.headersTimeout = 120000;
   srv.keepAliveTimeout = 65000;
+
+  try {
+    await store.initAsync();
+  } catch (err) {
+    console.warn('[boot] state init failed, serving what we have:', err && err.message);
+  }
+  booted = true;
+  console.log(`Zarnkina Relay ready - Active pool keys: ${store.getTotalActivePoolKeys()}`);
 })();
