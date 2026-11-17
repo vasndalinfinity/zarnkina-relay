@@ -584,23 +584,35 @@ app.get('/api/client/quota', (req, res) => {
   const fiveLimit = Number(process.env.KEY_5H_TOKENS) || store.getQuotaLimits().fiveHour;
   const weekLimit = Number(process.env.KEY_WEEK_TOKENS) || store.getQuotaLimits().weekly;
   const record = sessionOwner || keyRec;
-  const quota = record ? (sessionOwner ? store.userQuota(record) : store.keyQuota(record)) : { ok: true };
+  // A key belongs to an account; the daily prompt counter lives on that account
+  // so a user with two devices and one key cannot double their allowance.
+  const ownerForQuota = sessionOwner || (keyRec ? (store.findUserById(keyRec.userId) || store.findUserByEmail(keyRec.userEmail)) : null);
+  const quota = ownerForQuota ? store.promptQuota(ownerForQuota) : { ok: true, used: 0, limit: 0, resetsAt: 0 };
   const percent = (used, limit) => (limit > 0 ? Math.min(100, Math.round((used / limit) * 1000) / 10) : 0);
   res.json({
     ok: true,
     allowed: quota.ok,
     reason: quota.reason || '',
+    plan: quota.plan || (ownerForQuota && ownerForQuota.pro ? 'pro' : 'free'),
+    prompts: {
+      used: quota.used || 0,
+      limit: quota.limit || 0,
+      remaining: Math.max(0, (quota.limit || 0) - (quota.used || 0)),
+      pct: percent(quota.used || 0, quota.limit || 0),
+      resetsAt: quota.resetsAt || 0,
+    },
+    // Kept for older clients: same shape, now derived from the daily counter.
     fiveHour: {
-      used: record ? Number(record.fiveHourTokens) || 0 : 0,
-      limit: fiveLimit,
-      pct: record ? percent(Number(record.fiveHourTokens) || 0, fiveLimit) : 0,
-      resetsAt: record ? Number(record.fiveHourResetAt) || 0 : 0,
+      used: quota.used || 0,
+      limit: quota.limit || 0,
+      pct: percent(quota.used || 0, quota.limit || 0),
+      resetsAt: quota.resetsAt || 0,
     },
     weekly: {
-      used: record ? Number(record.weeklyTokens) || 0 : 0,
-      limit: weekLimit,
-      pct: record ? percent(Number(record.weeklyTokens) || 0, weekLimit) : 0,
-      resetsAt: record ? Number(record.weeklyResetAt) || 0 : 0,
+      used: quota.used || 0,
+      limit: quota.limit || 0,
+      pct: percent(quota.used || 0, quota.limit || 0),
+      resetsAt: quota.resetsAt || 0,
     },
   });
 });
@@ -1082,44 +1094,25 @@ app.post('/v1/chat/completions', async (req, res) => {
   if (owner.status === 'closed') {
     return res.status(403).json({ error: { message: 'Account is closed by administrator', type: 'account_closed' } });
   }
-  if (!owner.whitelisted) {
-    return res.status(403).json({ error: { message: 'Account is not whitelisted', type: 'not_whitelisted' } });
-  }
 
-  // 1b. Per-key quota window (5h + weekly), when limits are configured.
-  if (keyRec) {
-    const quota = store.keyQuota(keyRec);
-    if (!quota.ok) {
-      const minutes = Math.max(0, Math.ceil((quota.resetsAt - Date.now()) / 60000));
-      return res.status(429).json({
-        error: {
-          message:
-            quota.reason === 'weekly_limit'
-              ? `Weekly key limit reached; resets in ${Math.ceil(minutes / 60)}h`
-              : `5-hour key limit reached; resets in ${minutes}m`,
-          type: 'quota_exceeded',
-        },
-      });
-    }
+  // v5: the whitelist no longer gates access. Every Google account that signs
+  // in gets the free daily prompt allowance; pro accounts get the larger one.
+  // One request is one prompt, counted before the stream starts so two tabs
+  // cannot both slip under the limit.
+  const accountQuota = store.promptQuota(owner);
+  if (!accountQuota.ok) {
+    const hours = Math.max(0, Math.ceil((accountQuota.resetsAt - Date.now()) / 3600000));
+    return res.status(429).json({
+      error: {
+        message: `Daily prompt limit reached (${accountQuota.used}/${accountQuota.limit}); resets in ${hours}h`,
+        type: 'quota_exceeded',
+        limit: accountQuota.limit,
+        used: accountQuota.used,
+        plan: accountQuota.plan,
+      },
+    });
   }
-
-  // 1c. Sessions have no API key; their 5h/weekly usage is tracked on the
-  // account record instead.
-  if (owner && !keyRec) {
-    const userQuota = store.userQuota(owner);
-    if (!userQuota.ok) {
-      const minutes = Math.max(0, Math.ceil((userQuota.resetsAt - Date.now()) / 60000));
-      return res.status(429).json({
-        error: {
-          message:
-            userQuota.reason === 'weekly_limit'
-              ? `Weekly account limit reached; resets in ${Math.ceil(minutes / 60)}h`
-              : `5-hour account limit reached; resets in ${minutes}m`,
-          type: 'quota_exceeded',
-        },
-      });
-    }
-  }
+  store.chargePrompt(owner.id);
 
   // 2. Check model catalog status & Pro privilege
   const modelEntry = store.findModel(askedModel);
