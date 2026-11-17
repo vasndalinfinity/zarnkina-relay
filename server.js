@@ -1435,9 +1435,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
+// Unknown paths answer in JSON: the relay has no HTML surface left.
+app.use((req, res) => {
+  res.status(404).json({ error: { message: 'Not found', type: 'not_found', path: req.path } });
+});
+
 (async () => {
-  await store.initAsync();
-  const srv = app.listen(PORT, '0.0.0.0', () => {
+  await store.initAsync();  const srv = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Zarnkina Relay listening on port ${PORT} - Active pool keys: ${store.getTotalActivePoolKeys()}`);
   });
   srv.requestTimeout = 0;
