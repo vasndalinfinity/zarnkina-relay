@@ -457,7 +457,6 @@ app.post('/api/client/verify', rateLimit({ windowMs: 60_000, max: 30, key: 'veri
     if (!owner) return res.status(403).json({ ok: false, allowed: false, reason: 'not_found', error: 'Hesap bulunamadi.' });
     if (owner.status === 'frozen') return res.status(403).json({ ok: false, allowed: false, reason: 'frozen', error: 'Hesabiniz yonetici tarafindan dondurulmustur.' });
     if (owner.status === 'closed') return res.status(403).json({ ok: false, allowed: false, reason: 'closed', error: 'Hesabiniz yonetici tarafindan kapatilmistir.' });
-    if (!owner.whitelisted) return res.status(403).json({ ok: false, allowed: false, reason: 'not_whitelisted', error: 'Hesabiniz whitelistte yer almiyor.' });
     return res.json({
       ok: true,
       allowed: true,
@@ -492,14 +491,10 @@ app.post('/api/client/verify', rateLimit({ windowMs: 60_000, max: 30, key: 'veri
     });
   }
 
-  let allowed = Boolean(user.whitelisted) && user.status === 'active';
+  let allowed = user.status === 'active';
   let reason = 'ok';
   let errMsg = '';
-  if (!user.whitelisted) {
-    allowed = false;
-    reason = 'not_whitelisted';
-    errMsg = `'${email}' hesabı whitelistte yer almıyor.`;
-  } else if (user.status === 'frozen') {
+  if (user.status === 'frozen') {
     allowed = false;
     reason = 'frozen';
     errMsg = `'${email}' hesabı yönetici tarafından geçici olarak dondurulmuştur.`;
@@ -564,19 +559,29 @@ app.post('/api/client/google-token', async (req, res) => {
     if (!email || info.email_verified === false) {
       return res.status(401).json({ ok: false, error: 'Google account email could not be verified.' });
     }
-    const user = store.findUserByEmail(email);
+    // v5: any verified Google account gets a record on first sign-in. The
+    // whitelist is gone, so the only gate here is the account status.
+    let user = store.findUserByEmail(email);
+    if (!user) {
+      const created = store.upsertUser({ email, whitelisted: true, pro: false, status: 'active' });
+      if (!created.ok) return res.status(400).json({ ok: false, error: created.error || 'Account could not be created.' });
+      user = created.user;
+    }
+    if (user.status === 'frozen') {
+      return res.status(403).json({ ok: false, error: 'Account is frozen by administrator.' });
+    }
+    if (user.status === 'closed') {
+      return res.status(403).json({ ok: false, error: 'Account is closed by administrator.' });
+    }
     return res.json({
       ok: true,
       email,
       name: info.name || email,
       picture: info.picture || '',
-      whitelisted: Boolean(user && user.whitelisted),
-      pro: Boolean(user && user.pro),
-      status: user ? user.status : 'unregistered',
-      sessionToken:
-        user && user.whitelisted && user.status === 'active'
-          ? signSessionToken(email, req.headers['x-zarnkina-device'] || '')
-          : undefined,
+      whitelisted: Boolean(user.whitelisted),
+      pro: Boolean(user.pro),
+      status: user.status,
+      sessionToken: signSessionToken(email, req.headers['x-zarnkina-device'] || ''),
     });
   } catch (error) {
     return res.status(503).json({ ok: false, error: `Google sign-in unreachable: ${error.message}` });
