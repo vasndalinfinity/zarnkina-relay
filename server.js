@@ -1216,37 +1216,40 @@ app.post('/v1/chat/completions', async (req, res) => {
     return res.status(403).json({ error: { message: 'Account is closed by administrator', type: 'account_closed' } });
   }
 
-  // v5 client contract: every request names the product and version, and the
-  // account must have pinged in the last 30 seconds. This blocks honest old
-  // builds; a custom client can spoof the header, which is why quota and auth
-  // stay server-side.
-  const clientTag = String(req.headers['x-zarnkina-client'] || '').trim();
-  const [clientFamily, clientVersion] = clientTag.split('/');
-  const minClient = {
-    app: process.env.MIN_APP_VERSION || '5.3.0',
-    cli: process.env.MIN_CLI_VERSION || '5.2.0',
-  };
-  if (
-    !clientFamily ||
-    !clientVersion ||
-    !minClient[clientFamily] ||
-    !versionAtLeast(clientVersion, minClient[clientFamily])
-  ) {
-    return res.status(426).json({
-      error: {
-        message: `Client update required. Minimum: app ${minClient.app}, cli ${minClient.cli}.`,
-        type: 'upgrade_required',
-        min: minClient,
-      },
-    });
-  }
-  if (!store.seenFresh(owner.id, 30000)) {
-    return res.status(401).json({
-      error: {
-        message: 'Presence expired. The client must POST /api/client/ping every 5 seconds.',
-        type: 'presence_required',
-      },
-    });
+  // v5 client contract: the app and the CLI identify themselves and beat every
+  // five seconds. A bearer API key is an explicit integration (opencode, SDKs,
+  // scripts) and cannot hold a presence connection, so the key path skips the
+  // version and presence gates; quota and auth still apply per request.
+  const viaApiKey = Boolean(keyRec);
+  if (!viaApiKey) {
+    const clientTag = String(req.headers['x-zarnkina-client'] || '').trim();
+    const [clientFamily, clientVersion] = clientTag.split('/');
+    const minClient = {
+      app: process.env.MIN_APP_VERSION || '5.3.0',
+      cli: process.env.MIN_CLI_VERSION || '5.2.0',
+    };
+    if (
+      !clientFamily ||
+      !clientVersion ||
+      !minClient[clientFamily] ||
+      !versionAtLeast(clientVersion, minClient[clientFamily])
+    ) {
+      return res.status(426).json({
+        error: {
+          message: `Client update required. Minimum: app ${minClient.app}, cli ${minClient.cli}.`,
+          type: 'upgrade_required',
+          min: minClient,
+        },
+      });
+    }
+    if (!store.seenFresh(owner.id, 30000)) {
+      return res.status(401).json({
+        error: {
+          message: 'Presence expired. The client must POST /api/client/ping every 5 seconds.',
+          type: 'presence_required',
+        },
+      });
+    }
   }
 
   // v5: the whitelist no longer gates access. Every Google account that signs
