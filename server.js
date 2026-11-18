@@ -878,6 +878,14 @@ app.delete('/api/admin/logs', requireAdmin, (req, res) => {
   res.json({ ok: true, cleared });
 });
 
+// One bad row is usually probe residue from a test account; clearing the whole
+// log to drop it also throws away the real traffic history next to it.
+app.delete('/api/admin/logs/:id', requireAdmin, (req, res) => {
+  const result = store.deleteRequestLog(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
 app.delete('/api/admin/upstream-keys/:id', requireAdmin, (req, res) => {
   const result = store.deleteUpstreamKey(req.params.id);
   if (!result.ok) return res.status(404).json(result);
