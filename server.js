@@ -617,6 +617,62 @@ app.get('/api/client/quota', (req, res) => {
   });
 });
 
+// ---- Self-service API key ---------------------------------------------
+// One key per account, managed with the session token the app already holds.
+// The plain key leaves the server exactly once, on creation; afterwards only
+// the masked form is ever returned.
+function clientSessionUser(req) {
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = String(req.headers['x-zarnkina-token'] || '').trim();
+  const email = verifySessionToken(
+    headerToken || (bearer.startsWith('zk_sess_') ? bearer : '')
+  );
+  if (!email) return null;
+  return store.findUserByEmail(email);
+}
+
+app.get('/api/client/key', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (!owner) return res.status(401).json({ ok: false, error: 'Authentication required.' });
+  const key = store.keyForEmail(owner.email);
+  res.json({
+    ok: true,
+    key: key
+      ? {
+          masked: key.masked,
+          label: key.label,
+          active: key.active,
+          createdAt: key.createdAt,
+          lastUsedAt: key.lastUsedAt,
+        }
+      : null,
+  });
+});
+
+app.post('/api/client/key', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (!owner) return res.status(401).json({ ok: false, error: 'Authentication required.' });
+  const label = String((req.body && req.body.label) || 'desktop').slice(0, 48);
+  const result = store.rotateApiKey({ userEmail: owner.email, label });
+  if (!result.ok) return res.status(400).json(result);
+  res.json({
+    ok: true,
+    key: { masked: result.key.masked, active: result.key.active, label: result.key.label },
+    plainKey: result.plainKey,
+  });
+});
+
+app.patch('/api/client/key', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (!owner) return res.status(401).json({ ok: false, error: 'Authentication required.' });
+  const key = store.keyForEmail(owner.email);
+  if (!key) return res.status(404).json({ ok: false, error: 'No key yet.' });
+  const active = Boolean(req.body && req.body.active);
+  store.setApiKeyActive(key.id, active);
+  res.json({ ok: true, key: { masked: key.masked, active } });
+});
+
 // ---- Admin Authentication ----
 app.get('/api/admin/session', (req, res) => {
   res.json({ ok: true, authenticated: isAdminRequest(req) });
