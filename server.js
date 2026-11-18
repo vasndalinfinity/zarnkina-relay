@@ -23,7 +23,11 @@ const app = express();
 const rateBuckets = new Map();
 function rateLimit({ windowMs, max, key = 'default' }) {
   return (req, res, next) => {
-    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+    // Cloudflare sets cf-connecting-ip and overwrites any client-supplied copy;
+    // req.ip alone would be the edge address for every user behind the proxy.
+    const ip = String(
+      req.headers['cf-connecting-ip'] || req.ip || req.socket.remoteAddress || 'unknown'
+    ).trim();
     const bucketKey = key + ':' + ip;
     const now = Date.now();
     const bucket = rateBuckets.get(bucketKey) || { count: 0, resetAt: now + windowMs };
@@ -266,6 +270,12 @@ function getRemoteHost(req) {
   const host = remoteHosts.get(secret);
   return host ? { secret, host } : null;
 }
+
+// The remote-control channel is not part of v5. Every route answers 410 so the
+// six digit pairing code cannot be brute-forced into a host command queue.
+app.all('/api/remote/*', (_req, res) =>
+  res.status(410).json({ ok: false, error: 'Remote control is disabled.' })
+);
 
 app.post('/api/remote/register', (req, res) => {
   const existing = String(req.body?.hostSecret || '').trim();
@@ -993,6 +1003,17 @@ function resolveUpstreams(askedModel, modelEntry) {
 // Piping them through would tell any client exactly which upstream answers.
 // Every response is rewritten to the public model id the caller asked for.
 
+// Streaming chunks carry the upstream model id on almost every frame. Rewrite
+// it to the public id and blank the vendor fingerprint fields before the frame
+// leaves the process; non-stream responses go through scrubJsonPayload.
+function scrubSseText(text, askedModel) {
+  if (!text) return text;
+  return String(text)
+    .replace(/"model"\s*:\s*"[^"]*"/g, `"model":"${askedModel}"`)
+    .replace(/"system_fingerprint"\s*:\s*"[^"]*"/g, '"system_fingerprint":""')
+    .replace(/"provider"\s*:\s*"[^"]*"/g, '"provider":""');
+}
+
 function scrubJsonPayload(payload, askedModel) {
   if (!payload || typeof payload !== 'object') return payload;
   payload.model = askedModel;
@@ -1391,7 +1412,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
   }
 
-  const logEmail = owner ? owner.email : (clientEmail || 'Relay Client');
+  const logEmail = owner ? owner.email : 'Relay Client';
   if (!chosenRes) {
     store.recordRequestLog({
       email: logEmail,
@@ -1447,7 +1468,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           const step = Math.max(1, Math.floor(firstText.length / 4));
           approxTokens += step;
           totalTokens += step;
-          res.write(firstText);
+          res.write(scrubSseText(firstText, askedModel));
         }
       }
 
@@ -1459,7 +1480,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           const step = Math.max(1, Math.floor(chunk.length / 4));
           approxTokens += step;
           totalTokens += step;
-          res.write(chunk);
+          res.write(scrubSseText(chunk, askedModel));
         }
       }
       clearInterval(hb);
