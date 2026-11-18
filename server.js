@@ -1097,10 +1097,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 
   // v5: the whitelist no longer gates access. Every Google account that signs
   // in gets the free daily prompt allowance; pro accounts get the larger one.
-  // One request is one prompt, counted before the stream starts so two tabs
-  // cannot both slip under the limit.
+  // A follow-up call inside an already charged turn is allowed even if the
+  // counter just hit the limit: the user paid for that turn once.
+  const turnId = String(req.headers['x-zarnkina-turn'] || '').trim();
+  const sameTurn = store.isSameOpenTurn(owner.id, turnId);
   const accountQuota = store.promptQuota(owner);
-  if (!accountQuota.ok) {
+  if (!sameTurn && !accountQuota.ok) {
     const hours = Math.max(0, Math.ceil((accountQuota.resetsAt - Date.now()) / 3600000));
     return res.status(429).json({
       error: {
@@ -1112,7 +1114,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       },
     });
   }
-  store.chargePrompt(owner.id);
+  // One user turn is one prompt: the first call of a turn charges, the rest of
+  // that turn (tool steps, subagents, compaction) carries the same id for free.
+  if (!sameTurn) {
+    if (turnId) store.beginTurnPrompt(owner.id, turnId);
+    else store.chargePrompt(owner.id);
+  }
 
   // 2. Check model catalog status & Pro privilege
   const modelEntry = store.findModel(askedModel);
