@@ -1,0 +1,1647 @@
+// Zarnkina Model Relay & Admin Control Plane
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const crypto = require('crypto');
+const { Store } = require('./lib/store');
+const routes = require('./lib/routes');
+const {
+  COOKIE_NAME,
+  verifyAdminSecret,
+  signAdminSession,
+  isAdminRequest,
+  normalizeEmail,
+  signSessionToken,
+  verifySessionToken,
+  verifySessionDevice,
+} = require('./lib/auth');
+
+const app = express();
+
+function versionAtLeast(version, minimum) {
+  const parse = (value) =>
+    String(value || '')
+      .split('.')
+      .map((part) => parseInt(part, 10) || 0);
+  const current = parse(version);
+  const floor = parse(minimum);
+  const len = Math.max(current.length, floor.length);
+  for (let i = 0; i < len; i += 1) {
+    const a = current[i] || 0;
+    const b = floor[i] || 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
+// Naive in-memory buckets: enough to stop scripted probing of the account
+// oracle and the admin password.
+const rateBuckets = new Map();
+function rateLimit({ windowMs, max, key = 'default' }) {
+  return (req, res, next) => {
+    // Cloudflare sets cf-connecting-ip and overwrites any client-supplied copy;
+    // req.ip alone would be the edge address for every user behind the proxy.
+    const ip = String(
+      req.headers['cf-connecting-ip'] || req.ip || req.socket.remoteAddress || 'unknown'
+    ).trim();
+    const bucketKey = key + ':' + ip;
+    const now = Date.now();
+    const bucket = rateBuckets.get(bucketKey) || { count: 0, resetAt: now + windowMs };
+    if (now > bucket.resetAt) {
+      bucket.count = 0;
+      bucket.resetAt = now + windowMs;
+    }
+    bucket.count += 1;
+    rateBuckets.set(bucketKey, bucket);
+    if (bucket.count > max) {
+      res.setHeader('Retry-After', Math.ceil((bucket.resetAt - now) / 1000));
+      return res.status(429).json({ ok: false, error: 'Too many requests, slow down.' });
+    }
+    next();
+  };
+}
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+const PORT = process.env.PORT || 8080;
+// How long an account may stay silent before the next one is tried. Reasoning
+// models think before they answer, so this is generous on purpose.
+const FIRST_BYTE_TIMEOUT_MS = 25000;
+const store = new Store();
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception (kept alive):', err && err.message ? err.message : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled rejection (kept alive):', reason);
+});
+
+// The upstream endpoints are not in this file. Anything downstream of auth is
+// resolved from the host-only routing table (lib/routes.js -> data/routes.json).
+const keyPointers = new Map();
+
+// A free pool throttles the whole network address, not only the accounts that
+// belong to it. Firing several requests at the same pool in parallel burns
+// that shared budget in one go, so every cluster gets a gate: a number of
+// parallel requests and a minimum spacing between their starts. The values
+// come from the routing table, so paid pools run at full width.
+const clusterGates = new Map();
+
+function acquireClusterSlot(clusterId) {
+  const id = String(clusterId || '').trim();
+  if (!id) return Promise.resolve(() => {});
+  const limits = routes.gateFor(id);
+  const gate = clusterGates.get(id) || { inflight: 0, nextStart: 0 };
+  clusterGates.set(id, gate);
+  return new Promise((resolve) => {
+    const start = () => {
+      gate.inflight += 1;
+      gate.nextStart = Date.now() + limits.minSpacingMs;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        gate.inflight = Math.max(0, gate.inflight - 1);
+      });
+    };
+    const wait = () => {
+      if (gate.inflight >= limits.maxInflight) {
+        setTimeout(wait, 100);
+        return;
+      }
+      const delay = Math.max(0, gate.nextStart - Date.now());
+      if (delay > 0) setTimeout(start, delay);
+      else start();
+    };
+    wait();
+  });
+}
+
+// Failure bodies are short JSON documents. These helpers read the reason out
+// of them so the relay can park the right scope: one key, one model, or the
+// whole cluster when the egress address itself is throttled.
+function extractUpstreamMessage(bodyText) {
+  const raw = String(bodyText || '');
+  if (!raw) return '';
+  try {
+    const parsed = JSON.parse(raw);
+    return String(parsed?.error?.message || parsed?.message || '').trim();
+  } catch {
+    return raw.slice(0, 300).trim();
+  }
+}
+
+function isSharedAddressLimit(message) {
+  return /sharing this network address|shared (?:ip|address)|many .* accounts/i.test(String(message || ''));
+}
+
+function isModelUnavailable(message) {
+  return /is not available|model_unavailable|not found|unknown model/i.test(String(message || ''));
+}
+
+// "You can send your next request in 59 min 1 s." and "try again in 14s" both
+// carry the real wait. Honouring it beats a fixed one-minute guess.
+function parseRetryWaitMs(message) {
+  const raw = String(message || '');
+  const m = /in\s+((?:\d+\s*(?:min|minute|minutes|m|sec|second|seconds|s|hour|hours|h)\s*)+)/i.exec(raw);
+  if (!m) return 0;
+  let total = 0;
+  const re = /(\d+)\s*(min|minute|minutes|m|sec|second|seconds|s|hour|hours|h)/gi;
+  let hit;
+  while ((hit = re.exec(m[1]))) {
+    const value = Number(hit[1]);
+    const unit = hit[2].toLowerCase();
+    if (unit.startsWith('h')) total += value * 3600 * 1000;
+    else if (unit.startsWith('m')) total += value * 60 * 1000;
+    else total += value * 1000;
+  }
+  // A wait longer than an hour is a daily window, not a rate window.
+  return total > 0 && total <= 6 * 3600 * 1000 ? total : 0;
+}
+
+function nextPointer(clusterId) {
+  const current = keyPointers.get(clusterId) || 0;
+  keyPointers.set(clusterId, current + 1);
+  return current;
+}
+
+// The window is filled in two tiers: accounts that already answered for this
+// model first (they rotate among themselves so one key does not carry the
+// whole load), then the accounts whose entitlement is still unknown. A free
+// catalogue rotates its models behind the keys, so a wide window matters:
+// the first request after a deploy has to find a working account.
+function getNextKeys(clusterId, maxCount = 6, model = '') {
+  const groups = store.getActivePoolKeyGroups(clusterId, model);
+  const out = [];
+  const takeFrom = (list, wanted) => {
+    if (!list.length || out.length >= maxCount) return;
+    const start = nextPointer(`${clusterId}:${list.length}:${wanted}`) % list.length;
+    for (let i = 0; i < list.length && out.length < maxCount; i++) {
+      const key = list[(start + i) % list.length];
+      if (!out.includes(key)) out.push(key);
+    }
+  };
+  takeFrom(groups.preferred, 'p');
+  takeFrom(groups.others, 'o');
+  return out;
+}
+
+function getNextBackupKeys(poolName, maxCount = 4) {
+  const keys = store.getBackupPoolKeys(poolName);
+  if (!keys.length) return [];
+  const count = Math.min(keys.length, maxCount);
+  const start = keyPointers[poolName] || 0;
+  keyPointers[poolName] = start + 1;
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push(keys[(start + i) % keys.length]);
+  }
+  return out;
+}
+
+const startTime = Date.now();
+let totalTokens = 0;
+let totalRequests = 0;
+
+function getMetricsJson() {
+  const uptimeSec = Math.floor((Date.now() - startTime) / 1000);
+  const tps = uptimeSec > 0 ? (totalTokens / uptimeSec).toFixed(2) : '0.00';
+  const models = store.listModels();
+  const activeModels = models.filter((m) => m.status === 'active').length;
+  return {
+    name: 'Zarnkina Model Relay Gateway',
+    status: 'healthy',
+    uptime_seconds: uptimeSec,
+    total_requests: totalRequests,
+    active_edge_nodes: store.getTotalActivePoolKeys(),
+    models_available: activeModels,
+    models_total: models.length,
+    estimated_tps: tps,
+    version: '3.0.0',
+  };
+}
+
+function requireAdmin(req, res, next) {
+  if (!isAdminRequest(req)) {
+    return res.status(401).json({ ok: false, error: 'Yetkisiz erisim. Lutfen admin girisi yapin.' });
+  }
+  next();
+}
+
+// The public site is gone: this relay serves JSON and the model API only.
+// Status lives at /health and /health-json; the operator panel ships inside
+// the desktop app (it talks to /api/admin/* through a native command).
+
+app.get('/health-json', (_req, res) => res.json(getMetricsJson()));
+app.get('/health', (_req, res) =>
+  res.json({
+    status: 'ok',
+    active_nodes: store.getTotalActivePoolKeys(),
+    models: store.listModels().length,
+    catalog_version: store.state.catalogVersion || 0,
+    routes_ready: routes.ready(),
+  })
+);
+
+app.get('/', (_req, res) => res.json(getMetricsJson()));
+
+// Desktop release / auto-update manifest
+// Beta channel: the manifest can carry a pre-release next to the stable one.
+app.get('/api/public/release', (req, res) => {
+  const channel = String(req.query.channel || 'stable').toLowerCase();
+  const release = store.getRelease() || {};
+  if (channel === 'beta' && release.betaVersion) {
+    return res.json({
+      ok: true,
+      version: release.betaVersion,
+      notes: release.betaNotes || release.notes || '',
+      downloadUrl: release.betaDownloadUrl || release.downloadUrl || '',
+      autoUpdate: release.autoUpdate !== false,
+      sha256: release.betaSha256 || '',
+      channel: 'beta',
+    });
+  }
+  res.json({ ok: true, ...release, channel: 'stable' });
+});
+
+// Public model roster (sanitized: never leaks routeCluster/upstreamModel)
+app.get('/api/public/models', (_req, res) => {
+  res.json({
+    ok: true,
+    models: store.getPublicModels(),
+  });
+});
+
+// ---- Remote Control Bridge Relay ----
+const remoteHosts = new Map(); // hostSecret -> { pairCode, codeExpiresAt, running, label, browsers: Map<id, session>, queue: [], events: [] }
+const remoteBrowsers = new Map(); // browserId -> hostSecret
+
+function makePairCode() {
+  return String(crypto.randomInt(100000, 999999));
+}
+
+function getRemoteHost(req) {
+  const secret = String(req.headers['x-remote-secret'] || req.query.hostSecret || req.body?.hostSecret || '').trim();
+  if (!secret) return null;
+  const host = remoteHosts.get(secret);
+  return host ? { secret, host } : null;
+}
+
+// The remote-control channel is not part of v5. Every route answers 410 so the
+// six digit pairing code cannot be brute-forced into a host command queue.
+app.all('/api/remote/*', (_req, res) =>
+  res.status(410).json({ ok: false, error: 'Remote control is disabled.' })
+);
+
+app.post('/api/remote/register', (req, res) => {
+  const existing = String(req.body?.hostSecret || '').trim();
+  const label = String(req.body?.label || 'Zarnkina PC').slice(0, 64);
+  if (existing && remoteHosts.has(existing)) {
+    const h = remoteHosts.get(existing);
+    h.running = true;
+    h.lastHeartbeat = Date.now();
+    return res.json({
+      ok: true,
+      hostSecret: existing,
+      running: h.running,
+      code: h.codeExpiresAt > Date.now() ? h.pairCode : null,
+      sessions: [...h.browsers.values()],
+    });
+  }
+  const secret = 'rhost_' + crypto.randomBytes(18).toString('hex');
+  const code = makePairCode();
+  const host = {
+    pairCode: code,
+    codeExpiresAt: Date.now() + 10 * 60 * 1000,
+    running: true,
+    label,
+    browsers: new Map(),
+    queue: [],
+    events: [],
+    lastHeartbeat: Date.now(),
+  };
+  remoteHosts.set(secret, host);
+  res.json({ ok: true, hostSecret: secret, running: true, code, sessions: [] });
+});
+
+app.get('/api/remote/status', (req, res) => {
+  const hit = getRemoteHost(req);
+  if (!hit) return res.json({ ok: true, running: false, code: null, sessions: [] });
+  const { host } = hit;
+  host.lastHeartbeat = Date.now();
+  const codeValid = host.codeExpiresAt > Date.now();
+  res.json({
+    ok: true,
+    running: host.running,
+    code: codeValid ? host.pairCode : null,
+    codeExpiresAt: codeValid ? host.codeExpiresAt : null,
+    sessions: [...host.browsers.values()],
+  });
+});
+
+app.post('/api/remote/new-code', (req, res) => {
+  const hit = getRemoteHost(req);
+  if (!hit) return res.status(404).json({ ok: false, error: 'Remote session not found.' });
+  const { host } = hit;
+  host.pairCode = makePairCode();
+  host.codeExpiresAt = Date.now() + 10 * 60 * 1000;
+  host.running = true;
+  res.json({ ok: true, code: host.pairCode, expiresAt: host.codeExpiresAt });
+});
+
+app.post('/api/remote/disable', (req, res) => {
+  const hit = getRemoteHost(req);
+  if (!hit) return res.json({ ok: true, running: false });
+  hit.host.running = false;
+  res.json({ ok: true, running: false });
+});
+
+app.post('/api/remote/revoke', (req, res) => {
+  const hit = getRemoteHost(req);
+  if (!hit) return res.status(404).json({ ok: false, error: 'Session not found.' });
+  const bid = String(req.body?.id || '');
+  hit.host.browsers.delete(bid);
+  remoteBrowsers.delete(bid);
+  res.json({ ok: true, sessions: [...hit.host.browsers.values()] });
+});
+
+app.post('/api/remote/pair', (req, res) => {
+  const code = String(req.body?.code || '').trim();
+  const label = String(req.body?.label || req.headers['user-agent']?.slice(0, 48) || 'Browser').trim();
+  if (!/^\d{6}$/.test(code)) {
+    return res.status(400).json({ ok: false, error: 'Enter a valid 6-digit pairing code.' });
+  }
+  const now = Date.now();
+  for (const [secret, host] of remoteHosts.entries()) {
+    if (host.running && host.pairCode === code && host.codeExpiresAt > now) {
+      host.pairCode = makePairCode();
+      host.codeExpiresAt = 0; // single-use code
+      const browserId = 'rb_' + crypto.randomBytes(12).toString('hex');
+      const sess = {
+        id: browserId,
+        label,
+        origin: req.headers.origin || req.ip || 'web',
+        lastSeen: now,
+      };
+      host.browsers.set(browserId, sess);
+      remoteBrowsers.set(browserId, secret);
+      return res.json({ ok: true, browserId, hostLabel: host.label });
+    }
+  }
+  return res.status(404).json({ ok: false, error: 'Invalid or expired pairing code.' });
+});
+
+app.post('/api/remote/command', (req, res) => {
+  const browserId = String(req.body?.browserId || '').trim();
+  const text = String(req.body?.text || '').trim();
+  const secret = remoteBrowsers.get(browserId);
+  const host = secret ? remoteHosts.get(secret) : null;
+  if (!host || !host.running || !host.browsers.has(browserId)) {
+    return res.status(401).json({ ok: false, error: 'Pairing closed or expired.' });
+  }
+  if (!text) return res.status(400).json({ ok: false, error: 'Command text is empty.' });
+  host.browsers.get(browserId).lastSeen = Date.now();
+  const cmdId = 'cmd_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
+  host.queue.push({ id: cmdId, browserId, text, at: Date.now() });
+  res.json({ ok: true, commandId: cmdId });
+});
+
+app.get('/api/remote/poll', (req, res) => {
+  const hit = getRemoteHost(req);
+  if (!hit || !hit.host.running) return res.json({ ok: true, commands: [] });
+  hit.host.lastHeartbeat = Date.now();
+  const commands = hit.host.queue.splice(0, 5);
+  res.json({ ok: true, commands });
+});
+
+app.post('/api/remote/events', (req, res) => {
+  const hit = getRemoteHost(req);
+  if (!hit) return res.status(404).json({ ok: false });
+  const events = Array.isArray(req.body?.events) ? req.body.events : [];
+  for (const ev of events) {
+    hit.host.events.push({ ...ev, ts: Date.now() });
+  }
+  if (hit.host.events.length > 250) {
+    hit.host.events = hit.host.events.slice(-250);
+  }
+  res.json({ ok: true });
+});
+
+app.get('/api/remote/stream', (req, res) => {
+  const browserId = String(req.query.browserId || '').trim();
+  const since = Number(req.query.since || 0);
+  const secret = remoteBrowsers.get(browserId);
+  const host = secret ? remoteHosts.get(secret) : null;
+  if (!host || !host.running || !host.browsers.has(browserId)) {
+    return res.status(401).json({ ok: false, error: 'Disconnected.' });
+  }
+  host.browsers.get(browserId).lastSeen = Date.now();
+  const items = host.events.filter((e) => e.ts > since);
+  const latestTs = items.length ? items[items.length - 1].ts : since;
+  res.json({ ok: true, events: items, latestTs });
+});
+
+// Client verification endpoint (for desktop/web whitelist + pro + account status checks)
+app.post('/api/client/verify', rateLimit({ windowMs: 60_000, max: 30, key: 'verify' }), (req, res) => {
+  const settings = store.getSettings();
+  const auth = req.headers.authorization || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const bodyKey = String(req.body?.apiKey || '').trim();
+  const rawKey = bodyKey || bearer;
+
+  if (rawKey && rawKey.startsWith('zk_live_')) {
+    const keyRec = store.findApiKeyByPlain(rawKey);
+    if (!keyRec) return res.status(401).json({ ok: false, allowed: false, reason: 'key_invalid', error: 'Gecersiz API anahtari.' });
+    if (!keyRec.active) return res.status(401).json({ ok: false, allowed: false, reason: 'key_disabled', error: 'API anahtari yonetici tarafindan kapatilmis.' });
+    const owner = store.findUserById(keyRec.userId) || store.findUserByEmail(keyRec.userEmail);
+    if (!owner) return res.status(403).json({ ok: false, allowed: false, reason: 'not_found', error: 'Hesap bulunamadi.' });
+    if (owner.status === 'frozen') return res.status(403).json({ ok: false, allowed: false, reason: 'frozen', error: 'Hesabiniz yonetici tarafindan dondurulmustur.' });
+    if (owner.status === 'closed') return res.status(403).json({ ok: false, allowed: false, reason: 'closed', error: 'Hesabiniz yonetici tarafindan kapatilmistir.' });
+    return res.json({
+      ok: true,
+      allowed: true,
+      sessionToken: signSessionToken(owner.email, req.headers['x-zarnkina-device'] || ''),
+      keyQuota: keyRec
+        ? {
+            fiveHourTokens: Number(keyRec.fiveHourTokens) || 0,
+            fiveHourResetAt: Number(keyRec.fiveHourResetAt) || 0,
+            weeklyTokens: Number(keyRec.weeklyTokens) || 0,
+            weeklyResetAt: Number(keyRec.weeklyResetAt) || 0,
+          }
+        : undefined,
+      user: { email: owner.email, whitelisted: owner.whitelisted, pro: owner.pro, status: owner.status, quotaResetAt: Number(owner.quotaResetAt || 0) },
+      models: store.getPublicModels(),
+    });
+  }
+
+  const email = normalizeEmail(req.body?.email || '');
+  if (!email) {
+    return res.status(400).json({ ok: false, allowed: false, error: 'E-posta veya API anahtari gerekli.' });
+  }
+  const user = store.findUserByEmail(email);
+  if (!user) {
+    return res.json({
+      ok: true,
+      found: false,
+      allowed: false,
+      reason: 'not_whitelisted',
+      error: `'${email}' hesabı yetkili kullanıcı listesinde (whitelist) yer almıyor.`,
+      user: { email, whitelisted: false, pro: false, status: 'unregistered' },
+      models: store.getPublicModels(),
+    });
+  }
+
+  let allowed = user.status === 'active';
+  let reason = 'ok';
+  let errMsg = '';
+  if (user.status === 'frozen') {
+    allowed = false;
+    reason = 'frozen';
+    errMsg = `'${email}' hesabı yönetici tarafından geçici olarak dondurulmuştur.`;
+  } else if (user.status === 'closed') {
+    allowed = false;
+    reason = 'closed';
+    errMsg = `'${email}' hesabı yönetici tarafından kalıcı olarak kapatılmıştır.`;
+  }
+
+  return res.json({
+    ok: true,
+    found: true,
+    allowed,
+    reason,
+    error: errMsg || undefined,
+    // A bare email claim is not proof of identity, so no session token is
+    // issued here unless the deployment opted into email-only auth.
+    sessionToken: undefined,
+    user: { email: user.email, whitelisted: user.whitelisted, pro: user.pro, status: user.status, quotaResetAt: Number(user.quotaResetAt || 0) },
+    models: store.getPublicModels(),
+  });
+});
+
+// Google code exchange lives here so the client secret never ships in a binary.
+app.post('/api/client/google-token', async (req, res) => {
+  const secret = String(process.env.GOOGLE_CLIENT_SECRET || '').trim();
+  const clientId = String(process.env.GOOGLE_CLIENT_ID || req.body?.clientId || '').trim();
+  const code = String(req.body?.code || '').trim();
+  const redirectUri = String(req.body?.redirectUri || 'http://127.0.0.1:8765').trim();
+  const codeVerifier = String(req.body?.codeVerifier || '').trim();
+  if (!secret || !clientId) {
+    return res.status(501).json({ ok: false, error: 'Sign-in is not configured on this relay.' });
+  }
+  if (!code) {
+    return res.status(400).json({ ok: false, error: 'Missing authorization code.' });
+  }
+  try {
+    const form = new URLSearchParams({
+      code,
+      client_id: clientId,
+      client_secret: secret,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+    });
+    // The client sends a PKCE challenge, so Google refuses the exchange unless
+    // the matching verifier comes back with the code.
+    if (codeVerifier) form.set('code_verifier', codeVerifier);
+    const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: form.toString(),
+    });
+    const tokenBody = await tokenRes.json().catch(() => ({}));
+    if (!tokenRes.ok || !tokenBody.access_token) {
+      return res.status(401).json({ ok: false, error: tokenBody.error_description || 'Google token exchange failed.' });
+    }
+    const infoRes = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${tokenBody.access_token}` },
+    });
+    const info = await infoRes.json().catch(() => ({}));
+    const email = normalizeEmail(info.email || '');
+    if (!email || info.email_verified === false) {
+      return res.status(401).json({ ok: false, error: 'Google account email could not be verified.' });
+    }
+    // v5: any verified Google account gets a record on first sign-in. The
+    // whitelist is gone, so the only gate here is the account status.
+    let user = store.findUserByEmail(email);
+    if (!user) {
+      const created = store.upsertUser({ email, whitelisted: true, pro: false, status: 'active' });
+      if (!created.ok) return res.status(400).json({ ok: false, error: created.error || 'Account could not be created.' });
+      user = created.user;
+    }
+    if (user.status === 'frozen') {
+      return res.status(403).json({ ok: false, error: 'Account is frozen by administrator.' });
+    }
+    if (user.status === 'closed') {
+      return res.status(403).json({ ok: false, error: 'Account is closed by administrator.' });
+    }
+    return res.json({
+      ok: true,
+      email,
+      name: info.name || email,
+      picture: info.picture || '',
+      whitelisted: Boolean(user.whitelisted),
+      pro: Boolean(user.pro),
+      status: user.status,
+      sessionToken: signSessionToken(email, req.headers['x-zarnkina-device'] || ''),
+    });
+  } catch (error) {
+    return res.status(503).json({ ok: false, error: `Google sign-in unreachable: ${error.message}` });
+  }
+});
+
+// Per-key quota telemetry for the desktop status bar: 5h and weekly usage in
+// absolute tokens and percent, plus the next reset time.
+app.get('/api/client/quota', (req, res) => {
+  const auth = String(req.headers['authorization'] || '').trim();
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = String(req.headers['x-zarnkina-token'] || '').trim();
+  let keyRec = null;
+  let sessionOwner = null;
+  if (bearer && bearer.startsWith('zk_live_')) {
+    keyRec = store.findApiKeyByPlain(bearer);
+    if (!keyRec || !keyRec.active) {
+      return res.status(401).json({ ok: false, error: 'Invalid or disabled API key.' });
+    }
+  } else {
+    const sessionEmail = verifySessionToken(headerToken || (bearer.startsWith('zk_sess_') ? bearer : ''));
+    if (!sessionEmail) {
+      return res.status(401).json({ ok: false, error: 'Authentication required.' });
+    }
+    const owner = store.findUserByEmail(sessionEmail);
+    if (!owner) {
+      return res.status(403).json({ ok: false, error: 'Account not found.' });
+    }
+    sessionOwner = owner;
+  }
+  const fiveLimit = Number(process.env.KEY_5H_TOKENS) || store.getQuotaLimits().fiveHour;
+  const weekLimit = Number(process.env.KEY_WEEK_TOKENS) || store.getQuotaLimits().weekly;
+  const record = sessionOwner || keyRec;
+  // A key belongs to an account; the daily prompt counter lives on that account
+  // so a user with two devices and one key cannot double their allowance.
+  const ownerForQuota = sessionOwner || (keyRec ? (store.findUserById(keyRec.userId) || store.findUserByEmail(keyRec.userEmail)) : null);
+  const quota = ownerForQuota ? store.promptQuota(ownerForQuota) : { ok: true, used: 0, limit: 0, resetsAt: 0 };
+  const percent = (used, limit) => (limit > 0 ? Math.min(100, Math.round((used / limit) * 1000) / 10) : 0);
+  res.json({
+    ok: true,
+    allowed: quota.ok,
+    reason: quota.reason || '',
+    plan: quota.plan || (ownerForQuota && ownerForQuota.pro ? 'pro' : 'free'),
+    prompts: {
+      used: quota.used || 0,
+      limit: quota.limit || 0,
+      remaining: Math.max(0, (quota.limit || 0) - (quota.used || 0)),
+      pct: percent(quota.used || 0, quota.limit || 0),
+      resetsAt: quota.resetsAt || 0,
+    },
+    // Kept for older clients: same shape, now derived from the daily counter.
+    fiveHour: {
+      used: quota.used || 0,
+      limit: quota.limit || 0,
+      pct: percent(quota.used || 0, quota.limit || 0),
+      resetsAt: quota.resetsAt || 0,
+    },
+    weekly: {
+      used: quota.used || 0,
+      limit: quota.limit || 0,
+      pct: percent(quota.used || 0, quota.limit || 0),
+      resetsAt: quota.resetsAt || 0,
+    },
+  });
+});
+
+// ---- Self-service API key ---------------------------------------------
+// One key per account, managed with the session token the app already holds.
+// The plain key leaves the server exactly once, on creation; afterwards only
+// the masked form is ever returned.
+function clientSessionUser(req) {
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = String(req.headers['x-zarnkina-token'] || '').trim();
+  const email = verifySessionToken(
+    headerToken || (bearer.startsWith('zk_sess_') ? bearer : '')
+  );
+  if (!email) return null;
+  return store.findUserByEmail(email);
+}
+
+app.get('/api/client/key', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (!owner) return res.status(401).json({ ok: false, error: 'Authentication required.' });
+  const key = store.keyForEmail(owner.email);
+  res.json({
+    ok: true,
+    key: key
+      ? {
+          masked: key.masked,
+          label: key.label,
+          active: key.active,
+          createdAt: key.createdAt,
+          lastUsedAt: key.lastUsedAt,
+        }
+      : null,
+  });
+});
+
+app.post('/api/client/key', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (!owner) return res.status(401).json({ ok: false, error: 'Authentication required.' });
+  const label = String((req.body && req.body.label) || 'desktop').slice(0, 48);
+  const result = store.rotateApiKey({ userEmail: owner.email, label });
+  if (!result.ok) return res.status(400).json(result);
+  res.json({
+    ok: true,
+    key: { masked: result.key.masked, active: result.key.active, label: result.key.label },
+    plainKey: result.plainKey,
+  });
+});
+
+app.patch('/api/client/key', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (!owner) return res.status(401).json({ ok: false, error: 'Authentication required.' });
+  const key = store.keyForEmail(owner.email);
+  if (!key) return res.status(404).json({ ok: false, error: 'No key yet.' });
+  const active = Boolean(req.body && req.body.active);
+  store.setApiKeyActive(key.id, active);
+  res.json({ ok: true, key: { masked: key.masked, active } });
+});
+
+// Presence: the app and the CLI beat every five seconds while they are open.
+app.post('/api/client/ping', (req, res) => {
+  const owner = clientSessionUser(req);
+  if (owner) {
+    store.touchSeen(owner.id, 'session');
+    return res.json({ ok: true, ttl: 30 });
+  }
+  const auth = String(req.headers.authorization || '');
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  if (bearer.startsWith('zk_live_')) {
+    const keyRec = store.findApiKeyByPlain(bearer);
+    if (keyRec && keyRec.active) {
+      const keyOwner =
+        store.findUserById(keyRec.userId) || store.findUserByEmail(keyRec.userEmail);
+      if (keyOwner) {
+        store.touchSeen(keyOwner.id, 'key');
+        return res.json({ ok: true, ttl: 30 });
+      }
+    }
+  }
+  return res.status(401).json({ ok: false, error: 'Authentication required.' });
+});
+
+// ---- Admin Authentication ----
+app.get('/api/admin/session', (req, res) => {
+  res.json({ ok: true, authenticated: isAdminRequest(req) });
+});
+
+app.post('/api/admin/login', rateLimit({ windowMs: 600_000, max: 8, key: 'adminlogin' }), (req, res) => {
+  const secret = String(req.body?.secret || '');
+  if (!verifyAdminSecret(secret)) {
+    return res.status(401).json({ ok: false, error: 'Hatali yonetici sifresi.' });
+  }
+  const backupSpec = routes.backup();
+  if (store.getTotalActivePoolKeys() === 0 || (backupSpec && store.getBackupPoolKeys(backupSpec.pool).length === 0)) {
+    store.unlockVault(secret.trim());
+  }
+  const token = signAdminSession();
+  res.cookie(COOKIE_NAME, token, {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: process.env.NODE_ENV === 'production' || req.secure || req.headers['x-forwarded-proto'] === 'https',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/',
+  });
+  res.json({ ok: true });
+});
+
+app.post('/api/admin/logout', (_req, res) => {
+  res.clearCookie(COOKIE_NAME, { path: '/' });
+  res.json({ ok: true });
+});
+
+// ---- Admin Control Suite Endpoints ----
+app.get('/api/admin/clusters', requireAdmin, (_req, res) => {
+  res.json({
+    ok: true,
+    ready: routes.ready(),
+    error: routes.ready() ? undefined : routes.error(),
+    clusters: routes.clusterIds().map((id) => ({ id, label: routes.clusterLabel(id) })),
+  });
+});
+
+app.get('/api/admin/state', requireAdmin, (_req, res) => {
+  const users = store.listUsers();
+  const apiKeys = store.listApiKeys();
+  const upstreamKeys = store.listUpstreamKeys();
+  const models = store.listModels();
+  const settings = store.getSettings();
+  const requestLogs = store.state.requestLogs || [];
+
+  res.json({
+    ok: true,
+    users,
+    apiKeys,
+    upstreamKeys,
+    models,
+    settings,
+    release: store.getRelease(),
+    requestLogs,
+    clusters: routes.clusterIds(),
+    stats: {
+      totalUsers: users.length,
+      whitelistedUsers: users.filter((u) => u.whitelisted).length,
+      proUsers: users.filter((u) => u.pro).length,
+      frozenUsers: users.filter((u) => u.status === 'frozen').length,
+      closedUsers: users.filter((u) => u.status === 'closed').length,
+      activeApiKeys: apiKeys.filter((k) => k.active).length,
+      totalApiKeys: apiKeys.length,
+      activePoolKeys: upstreamKeys.filter((k) => k.active).length,
+      totalPoolKeys: upstreamKeys.length,
+      activeModels: models.filter((m) => m.status === 'active').length,
+      totalModels: models.length,
+    },
+  });
+});
+
+app.post('/api/admin/settings', requireAdmin, (req, res) => {
+  const settings = store.updateSettings(req.body || {});
+  res.json({ ok: true, settings });
+});
+
+app.post('/api/admin/release', requireAdmin, (req, res) => {
+  const release = store.updateRelease(req.body || {});
+  res.json({ ok: true, release });
+});
+
+// 1 & 2 & 4. Whitelist, Pro Privilege, Freeze & Close Account
+app.post('/api/admin/users', requireAdmin, (req, res) => {
+  const result = store.upsertUser(req.body || {});
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.patch('/api/admin/users/:id', requireAdmin, (req, res) => {
+  const result = store.setUserFlags(req.params.id, req.body || {});
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+app.post('/api/admin/users/:id/reset-quota', requireAdmin, (req, res) => {
+  const result = store.resetUserQuota(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+app.delete('/api/admin/users/:id', requireAdmin, (req, res) => {
+  const result = store.deleteUser(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+// 3a. Client API Keys (Ekle / Kapat / Ac / Sil)
+app.post('/api/admin/keys', requireAdmin, (req, res) => {
+  const result = store.createApiKey(req.body || {});
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.patch('/api/admin/keys/:id', requireAdmin, (req, res) => {
+  const active = Boolean(req.body?.active);
+  const result = store.setApiKeyActive(req.params.id, active);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+app.delete('/api/admin/keys/:id', requireAdmin, (req, res) => {
+  const result = store.deleteApiKey(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+// 3b. Upstream Pool Keys (Ekle / Kapat / Ac / Sil)
+app.post('/api/admin/upstream-keys', requireAdmin, (req, res) => {
+  const { cluster, keys } = req.body || {};
+  const result = store.addUpstreamKeys(cluster, keys);
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.patch('/api/admin/upstream-keys/:id', requireAdmin, (req, res) => {
+  const active = Boolean(req.body?.active);
+  const result = store.setUpstreamKeyActive(req.params.id, active);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+// Request log entries can carry model names from a provider that was
+// retired. Clearing them keeps the operator's dashboard honest.
+app.delete('/api/admin/logs', requireAdmin, (req, res) => {
+  const cleared = store.clearRequestLogs();
+  res.json({ ok: true, cleared });
+});
+
+// One bad row is usually probe residue from a test account; clearing the whole
+// log to drop it also throws away the real traffic history next to it.
+app.delete('/api/admin/logs/:id', requireAdmin, (req, res) => {
+  const result = store.deleteRequestLog(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+app.delete('/api/admin/upstream-keys/:id', requireAdmin, (req, res) => {
+  const result = store.deleteUpstreamKey(req.params.id);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+// Pool & hidden backup key sync endpoint (for sync-pools.cjs)
+app.post('/api/keys/update', (req, res) => {
+  const { secret, pools, backupPools } = req.body || {};
+  if (!verifyAdminSecret(secret) && !isAdminRequest(req)) {
+    return res.status(403).json({ ok: false, error: 'Unauthorized access (Invalid secret)' });
+  }
+  if (pools) store.syncPoolFromApi(pools);
+  if (backupPools && typeof backupPools === 'object') {
+    for (const [bName, bKeys] of Object.entries(backupPools)) {
+      store.setBackupPool(bName, bKeys);
+    }
+  }
+  res.json({
+    ok: true,
+    active_nodes: store.getTotalActivePoolKeys(),
+    message: 'All node pools updated successfully!',
+  });
+});
+
+// 5. Model Management (Ekle / Kapat / Ac / Working on it / Tier / Sil)
+app.post('/api/admin/models', requireAdmin, (req, res) => {
+  const result = store.upsertModel(req.body || {});
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+
+app.patch('/api/admin/models/:id', requireAdmin, (req, res) => {
+  const result = store.setModelPatch(decodeURIComponent(req.params.id), req.body || {});
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+app.delete('/api/admin/models/:id', requireAdmin, (req, res) => {
+  const result = store.deleteModel(decodeURIComponent(req.params.id));
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+
+// OpenAI-compatible Models list endpoint (only active models exposed to SDKs)
+app.get('/v1/models', (_req, res) => {
+  const active = store.getPublicModels().filter((m) => m.status === 'active');
+  res.json({
+    object: 'list',
+    data: active,
+  });
+});
+
+
+// Smart Router: ordered routes from the host-only table (cluster rotation +
+// silent backup). Nothing here names a provider.
+function pushClusterRoutes(candidates, clusterId, targetModel) {
+  const base = routes.clusterUrl(clusterId);
+  if (!base) return;
+  const keys = getNextKeys(clusterId, 16, targetModel);
+  if (!keys.length) return;
+  // The capability lives in the routing table, so the upstream that cannot
+  // take tool definitions never receives them.
+  const canTools = routes.supportsTools(clusterId);
+  for (const key of keys) {
+    candidates.push({
+      url: `${base}/chat/completions`,
+      headers: { Authorization: `Bearer ${key}` },
+      targetModel,
+      poolKey: key,
+      clusterId,
+      supportsTools: canTools,
+    });
+  }
+}
+
+// A free catalogue can rotate the models behind its keys: the same account
+// may carry one alias now and a different one an hour later. When the pool
+// answers "model not available" for every candidate, the other free aliases
+// of the same pool are tried before the client sees an error.
+const FREE_ALIAS_SWAP = {
+  'deepseek-v4.1-flash:free': ['deepseek-v4-flash:free'],
+  'deepseek-v4-flash:free': ['deepseek-v4.1-flash:free'],
+};
+
+function pushAliasFallbackRoutes(candidates, clusterId, targetModel) {
+  const aliases = FREE_ALIAS_SWAP[targetModel];
+  if (!aliases) return;
+  const base = routes.clusterUrl(clusterId);
+  if (!base) return;
+  const canTools = routes.supportsTools(clusterId);
+  for (const alias of aliases) {
+    const keys = getNextKeys(clusterId, 8, alias);
+    if (!keys.length) continue;
+    for (const key of keys) {
+      const url = `${base}/chat/completions`;
+      // One candidate per account: a pool of 29 keys must not turn into 29
+      // copies of the same account in the failover walk.
+      if (candidates.some((c) => c.url === url && c.poolKey === key && c.targetModel === alias)) continue;
+      candidates.push({
+        url,
+        headers: { Authorization: `Bearer ${key}` },
+        targetModel: alias,
+        poolKey: key,
+        clusterId,
+        supportsTools: canTools,
+        aliasFallback: true,
+      });
+    }
+  }
+}
+
+function resolveUpstreams(askedModel, modelEntry) {
+  const candidates = [];
+  const asked = String(askedModel || '').toLowerCase();
+
+  const tableRoute = routes.modelRoute(askedModel);
+  // The catalogue is the only source of truth for what may be served. The
+  // substring fallback table exists to route a published id whose cluster
+  // entry is missing, never to guess a route for an id nobody published.
+  const route = (modelEntry && modelEntry.routeCluster && routes.clusterUrl(modelEntry.routeCluster)
+    ? {
+        cluster: modelEntry.routeCluster,
+        upstream: modelEntry.upstreamModel || askedModel,
+        alt: tableRoute && tableRoute.cluster === modelEntry.routeCluster ? tableRoute.alt : [],
+      }
+    : (tableRoute || (modelEntry ? routes.fallbackRoute(askedModel) : null)));
+
+  if (route && routes.clusterUrl(route.cluster)) {
+    pushClusterRoutes(candidates, route.cluster, route.upstream || askedModel);
+    for (const alt of route.alt || []) {
+      if (alt && alt.cluster) pushClusterRoutes(candidates, alt.cluster, alt.upstream || askedModel);
+    }
+  }
+
+  // The other free aliases of the same pool are the last resort: same
+  // quality class, same account pool, no new provider.
+  const aliasTargets = new Set();
+  for (const cand of candidates) {
+    if (!cand.clusterId || !cand.targetModel) continue;
+    const tag = `${cand.clusterId}|${cand.targetModel}`;
+    if (aliasTargets.has(tag)) continue;
+    aliasTargets.add(tag);
+    pushAliasFallbackRoutes(candidates, cand.clusterId, cand.targetModel);
+  }
+
+  const backup = routes.backup();
+  if (modelEntry && backup && backup.match.some((needle) => asked.includes(String(needle).toLowerCase()))) {
+    const target = backup.upstream || askedModel;
+    for (const key of getNextBackupKeys(backup.pool, 4)) {
+      candidates.push({
+        url: `${backup.url}/chat/completions`,
+        headers: { Authorization: `Bearer ${key}` },
+        targetModel: target,
+        poolKey: key,
+        supportsTools: routes.supportsTools(backup.cluster || ''),
+      });
+    }
+  }
+
+  return candidates;
+}
+
+// ---- Response scrubbing -------------------------------------------------
+// Upstream chunks and JSON bodies carry the upstream vendor own model id.
+// Piping them through would tell any client exactly which upstream answers.
+// Every response is rewritten to the public model id the caller asked for.
+
+// Streaming chunks carry the upstream model id on almost every frame. Rewrite
+// it to the public id and blank the vendor fingerprint fields before the frame
+// leaves the process; non-stream responses go through scrubJsonPayload.
+function scrubSseText(text, askedModel) {
+  if (!text) return text;
+  return String(text)
+    .replace(/"model"\s*:\s*"[^"]*"/g, `"model":"${askedModel}"`)
+    .replace(/"system_fingerprint"\s*:\s*"[^"]*"/g, '"system_fingerprint":""')
+    .replace(/"provider"\s*:\s*"[^"]*"/g, '"provider":""');
+}
+
+function scrubJsonPayload(payload, askedModel) {
+  if (!payload || typeof payload !== 'object') return payload;
+  payload.model = askedModel;
+  if ('system_fingerprint' in payload) delete payload.system_fingerprint;
+  return payload;
+}
+
+function scrubSseEvent(event, askedModel) {
+  return event
+    .split('\n')
+    .map((line) => {
+      if (!line.startsWith('data:')) return line;
+      const body = line.slice(5).trim();
+      if (!body || body === '[DONE]') return line;
+      try {
+        return 'data: ' + JSON.stringify(scrubJsonPayload(JSON.parse(body), askedModel));
+      } catch {
+        return line;
+      }
+    })
+    .join('\n');
+}
+
+// SSE events can be split across TCP reads, so hold the tail until the blank
+// line that ends the event arrives.
+function createSseScrubber(askedModel) {
+  let buffer = '';
+  return {
+    push(text) {
+      buffer += text;
+      let out = '';
+      let index;
+      while ((index = buffer.indexOf('\n\n')) >= 0) {
+        const event = buffer.slice(0, index);
+        buffer = buffer.slice(index + 2);
+        out += scrubSseEvent(event, askedModel) + '\n\n';
+      }
+      return out;
+    },
+    flush() {
+      const tail = buffer;
+      buffer = '';
+      if (!tail.trim()) return '';
+      return scrubSseEvent(tail, askedModel);
+    },
+  };
+}
+
+// Chat completions endpoint: key or signed session token, whitelist, pro,
+// freeze/close, model status, then cluster failover from the host table.
+app.post('/v1/chat/completions', async (req, res) => {
+  totalRequests++;
+  const settings = store.getSettings();
+  if (settings.chatEnabled === false) {
+    return res.status(503).json({
+      error: { message: 'This gateway is currently closed.', type: 'gateway_disabled' },
+    });
+  }
+  // Fail closed: without a host routing table this node must not invent an
+  // upstream out of hardcoded defaults.
+  if (!routes.ready()) {
+    return res.status(503).json({
+      error: { message: 'Gateway routing is not configured on this node.', type: 'gateway_unconfigured' },
+    });
+  }
+  const {
+    model,
+    messages,
+    stream,
+    temperature,
+    max_tokens,
+    reasoning_effort,
+    enable_thinking,
+    thinking,
+    tools,
+    tool_choice,
+    parallel_tool_calls,
+    response_format,
+    stop,
+    top_p,
+    frequency_penalty,
+    presence_penalty,
+    stream_options,
+    seed,
+  } = req.body || {};
+  const askedModel = String(model || 'zarnkina-glm-5.3-flash');
+
+  // A text model cannot take an image part: the upstream answers 400 and the
+  // whole turn dies. Flattening the parts keeps the text (and whatever the
+  // caller wrote around the image) usable, and a header tells the client why.
+  const modelForVision = store.findModel(askedModel);
+  const visionEnabled = Boolean(
+    modelForVision && String(modelForVision.inputs || '').includes('image')
+  );
+  let visionDropped = false;
+  const normalizedMessages = Array.isArray(messages)
+    ? messages.map((message) => {
+        if (!message || !Array.isArray(message.content)) return message;
+        if (visionEnabled) return message;
+        const texts = [];
+        for (const part of message.content) {
+          if (!part || typeof part !== 'object') continue;
+          if (part.type === 'text' && part.text) texts.push(String(part.text));
+          else if (part.type === 'image_url') visionDropped = true;
+        }
+        return { ...message, content: texts.join('\n') };
+      })
+    : messages;
+  if (visionDropped) res.setHeader('x-zarnkina-vision', 'dropped');
+
+  // 1. Identity: API key, or a signed session token issued by /api/client/verify.
+  // A bare email header is a claim, not proof, and is refused unless the
+  // deployment explicitly re-enables it.
+  const auth = req.headers.authorization || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+  const headerToken = String(req.headers['x-zarnkina-token'] || '').trim();
+  const claimedEmail = normalizeEmail(req.headers['x-zarnkina-email'] || '');
+  const sessionEmail = verifySessionToken(
+    headerToken || (bearer.startsWith('zk_sess_') ? bearer : '')
+  );
+  let keyRec = null;
+  let owner = null;
+
+  if (bearer && bearer.startsWith('zk_live_')) {
+    keyRec = store.findApiKeyByPlain(bearer);
+    if (!keyRec) {
+      return res.status(401).json({ error: { message: 'Invalid API key', type: 'invalid_auth' } });
+    }
+    if (!keyRec.active) {
+      return res.status(401).json({ error: { message: 'API key has been disabled by administrator', type: 'invalid_auth' } });
+    }
+    owner = store.findUserById(keyRec.userId) || store.findUserByEmail(keyRec.userEmail);
+    if (!owner) {
+      return res.status(403).json({ error: { message: 'Account not found', type: 'invalid_auth' } });
+    }
+  } else if (sessionEmail) {
+    owner = store.findUserByEmail(sessionEmail);
+    if (!owner) {
+      return res.status(403).json({ error: { message: 'Account not found', type: 'invalid_auth' } });
+    }
+  } else if (settings.requireApiKey) {
+    return res.status(401).json({ error: { message: 'Valid Zarnkina API key (zk_live_...) is required', type: 'invalid_auth' } });
+  } else {
+    return res.status(401).json({
+      error: {
+        message: 'Authentication required. Sign in to obtain a session token or provide a valid zk_live_ API key.',
+        type: 'auth_required',
+      },
+    });
+  }
+
+  if (owner.status === 'frozen') {
+    return res.status(403).json({ error: { message: 'Account is frozen by administrator', type: 'account_frozen' } });
+  }
+  if (owner.status === 'closed') {
+    return res.status(403).json({ error: { message: 'Account is closed by administrator', type: 'account_closed' } });
+  }
+
+  // v5 client contract: the app and the CLI identify themselves and beat every
+  // five seconds. A bearer API key is an explicit integration (opencode, SDKs,
+  // scripts) and cannot hold a presence connection, so the key path skips the
+  // version and presence gates; quota and auth still apply per request.
+  const viaApiKey = Boolean(keyRec);
+  if (!viaApiKey) {
+    const clientTag = String(req.headers['x-zarnkina-client'] || '').trim();
+    const [clientFamily, clientVersion] = clientTag.split('/');
+    const minClient = {
+      app: process.env.MIN_APP_VERSION || '5.3.0',
+      cli: process.env.MIN_CLI_VERSION || '5.2.0',
+    };
+    if (
+      !clientFamily ||
+      !clientVersion ||
+      !minClient[clientFamily] ||
+      !versionAtLeast(clientVersion, minClient[clientFamily])
+    ) {
+      return res.status(426).json({
+        error: {
+          message: `Client update required. Minimum: app ${minClient.app}, cli ${minClient.cli}.`,
+          type: 'upgrade_required',
+          min: minClient,
+        },
+      });
+    }
+    if (!store.seenFresh(owner.id, 30000)) {
+      return res.status(401).json({
+        error: {
+          message: 'Presence expired. The client must POST /api/client/ping every 5 seconds.',
+          type: 'presence_required',
+        },
+      });
+    }
+  }
+
+  // v5: the whitelist no longer gates access. Every Google account that signs
+  // in gets the free daily prompt allowance; pro accounts get the larger one.
+  // A follow-up call inside an already charged turn is allowed even if the
+  // counter just hit the limit: the user paid for that turn once.
+  const turnId = String(req.headers['x-zarnkina-turn'] || '').trim();
+  const sameTurn = store.isSameOpenTurn(owner.id, turnId);
+  const accountQuota = store.promptQuota(owner);
+  if (!sameTurn && !accountQuota.ok) {
+    const hours = Math.max(0, Math.ceil((accountQuota.resetsAt - Date.now()) / 3600000));
+    return res.status(429).json({
+      error: {
+        message: `Daily prompt limit reached (${accountQuota.used}/${accountQuota.limit}); resets in ${hours}h`,
+        type: 'quota_exceeded',
+        limit: accountQuota.limit,
+        used: accountQuota.used,
+        plan: accountQuota.plan,
+      },
+    });
+  }
+  // One user turn is one prompt: the first call of a turn charges, the rest of
+  // that turn (tool steps, subagents, compaction) carries the same id for free.
+  if (!sameTurn) {
+    if (turnId) store.beginTurnPrompt(owner.id, turnId);
+    else store.chargePrompt(owner.id);
+  }
+
+  // 2. Check model catalog status & Pro privilege
+  const modelEntry = store.findModel(askedModel);
+  if (modelEntry && modelEntry.status !== 'active') {
+    const reason = modelEntry.status === 'working_on_it'
+      ? `Model '${modelEntry.id}' is currently under maintenance (Working on it).`
+      : `Model '${modelEntry.id}' is currently disabled by administrator.`;
+    return res.status(503).json({ error: { message: reason, type: 'model_unavailable' } });
+  }
+
+  if (owner && modelEntry && modelEntry.tier === 'pro' && settings.enforceProModelGate && !owner.pro) {
+    return res.status(403).json({
+      error: { message: `Model '${modelEntry.id}' requires Pro privilege.`, type: 'pro_required' },
+    });
+  }
+
+  // 2b. Unknown model ids fail closed with a clean error. Guessing a route for
+  // an id the operator never published would let anyone reach an upstream
+  // model that is not in the catalogue, so the request dies here.
+  const knownRoute =
+    (modelEntry && modelEntry.routeCluster && routes.clusterUrl(modelEntry.routeCluster)) ||
+    routes.modelRoute(askedModel);
+  if (!knownRoute) {
+    return res.status(404).json({
+      error: {
+        message: `Unknown model '${askedModel}'. Fetch GET /api/public/models for the available list.`,
+        type: 'model_not_found',
+      },
+    });
+  }
+
+  req.setTimeout(0);
+  res.setTimeout(0);
+
+  const upstreamRoutes = resolveUpstreams(askedModel, modelEntry);
+  let chosenRes = null;
+  let chosenReader = null;
+  let chosenFirstChunk = null;
+  let chosenJsonData = null;
+  let lastStatus = 502;
+
+  // Every account of the pool is parked (a shared address limit or a model
+  // the accounts do not carry). Say so with a retry hint instead of a bare
+  // gateway error, so the client can wait instead of hammering.
+  if (!upstreamRoutes.length) {
+    const clusterId =
+      typeof knownRoute === 'string'
+        ? (modelEntry && modelEntry.routeCluster) || ''
+        : (knownRoute && knownRoute.cluster) || '';
+    const waitMs = clusterId ? store.getClusterCooldownRemaining(clusterId) : 0;
+    if (waitMs > 0) {
+      const seconds = Math.ceil(waitMs / 1000);
+      res.setHeader('Retry-After', String(seconds));
+      return res.status(429).json({
+        error: {
+          message: `Pool temporarily unavailable; retry in ${seconds}s`,
+          type: 'pool_rate_limited',
+        },
+      });
+    }
+  }
+
+  const defaultOutTokens = Math.min(modelEntry?.maxOutputTokens || 32768, 65536);
+
+  // The edge drops a connection that runs past its own limit and replaces the
+  // body with an HTML error page. Answering with JSON a little earlier is
+  // always better than an unparsable page, so the whole failover walk gets a
+  // deadline of its own.
+  const resolveDeadline = Date.now() + 100000;
+
+  // A shared-address limit applies to every account in the pool at once, so
+  // walking the rest of the candidates would only collect the same rejection.
+  let sharedLimitHit = false;
+  let lastRoute = null;
+
+  for (const route of upstreamRoutes) {
+    lastRoute = route;
+    if (Date.now() > resolveDeadline) {
+      lastStatus = 504;
+      break;
+    }
+    const ac = new AbortController();
+    // The per-attempt timeout never outlives the overall deadline.
+    const attemptBudget = Math.max(5000, Math.min(60000, resolveDeadline - Date.now()));
+    const timer = setTimeout(() => ac.abort(), attemptBudget);
+    // The cluster gate is held for the whole attempt so the pool sees one
+    // request at a time and the shared budget lasts.
+    let releaseSlot = () => {};
+    try {
+      releaseSlot = await acquireClusterSlot(route.clusterId);
+      const routeMaxTokens = !route.supportsTools
+        ? Math.min(max_tokens ?? 8192, 16000)
+        : (max_tokens ?? defaultOutTokens);
+      const upstreamPayload = {
+        model: route.targetModel,
+        messages: normalizedMessages || [],
+        stream: Boolean(stream),
+        temperature: temperature ?? 0.7,
+        max_tokens: routeMaxTokens,
+      };
+      // Clients signal "no reasoning" in three different ways. Every upstream
+      // behind this relay understands reasoning_effort, and a model that skips
+      // its thinking answers in seconds instead of a minute. The other two
+      // spellings are never forwarded: some backends reject unknown fields
+      // with a 400.
+      const clientWantsReasoning =
+        reasoning_effort !== 'none' &&
+        enable_thinking !== false &&
+        !(thinking && thinking.type === 'disabled');
+      if (!clientWantsReasoning) {
+        upstreamPayload.reasoning_effort = 'none';
+      } else if (reasoning_effort !== undefined) {
+        upstreamPayload.reasoning_effort = reasoning_effort;
+      }
+      if (tools !== undefined && route.supportsTools) upstreamPayload.tools = tools;
+      if (tool_choice !== undefined && route.supportsTools) upstreamPayload.tool_choice = tool_choice;
+      if (parallel_tool_calls !== undefined && route.supportsTools) upstreamPayload.parallel_tool_calls = parallel_tool_calls;
+      if (response_format !== undefined) upstreamPayload.response_format = response_format;
+      if (stop !== undefined) upstreamPayload.stop = stop;
+      if (top_p !== undefined) upstreamPayload.top_p = top_p;
+      if (frequency_penalty !== undefined) upstreamPayload.frequency_penalty = frequency_penalty;
+      if (presence_penalty !== undefined) upstreamPayload.presence_penalty = presence_penalty;
+      if (stream_options !== undefined) upstreamPayload.stream_options = stream_options;
+      if (seed !== undefined) upstreamPayload.seed = seed;
+      const upstreamRes = await fetch(route.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...route.headers },
+        body: JSON.stringify(upstreamPayload),
+        signal: ac.signal,
+      });
+      if (upstreamRes.ok) {
+        // The account answered, so any parking it carried is over. The
+        // success path breaks out of the loop, so the clear has to happen
+        // here or the key stays parked forever.
+        if (route.poolKey) {
+          store.clearPoolCooldown(route.poolKey);
+          store.clearPoolKeyModelUnavailable(route.poolKey, route.targetModel);
+        }
+        if (stream) {
+          if (!upstreamRes.body) {
+            clearTimeout(timer);
+            lastStatus = 502;
+            continue;
+          }
+          const reader = upstreamRes.body.getReader();
+          // A slow account must not hold the client hostage: if the first
+          // byte does not arrive in time, drop this account and try the next.
+          const first = await Promise.race([
+            reader.read(),
+            new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), FIRST_BYTE_TIMEOUT_MS)),
+          ]);
+          clearTimeout(timer);
+          if (first.timeout) {
+            try {
+              ac.abort();
+            } catch {}
+            lastStatus = 504;
+            continue;
+          }
+          if (first.done && (!first.value || first.value.length === 0)) {
+            lastStatus = 502;
+            continue;
+          }
+          chosenRes = upstreamRes;
+          chosenReader = reader;
+          chosenFirstChunk = first.done ? null : first.value;
+          break;
+        } else {
+          clearTimeout(timer);
+          chosenJsonData = await upstreamRes.json();
+          chosenRes = upstreamRes;
+          break;
+        }
+      }
+      lastStatus = upstreamRes.status;
+      // The failure body carries the reason: which model is missing, how long
+      // the account is parked, and whether the limit is the account or the
+      // shared network address. Reading it is the only way to park the right
+      // scope instead of guessing.
+      let failureText = '';
+      if (!upstreamRes.ok) {
+        try {
+          failureText = (await upstreamRes.text()).slice(0, 2000);
+        } catch {}
+      }
+      const failureMessage = extractUpstreamMessage(failureText);
+      if (upstreamRes.status === 429) {
+        if (isSharedAddressLimit(failureMessage)) {
+          // Every account behind this egress address is throttled together.
+          // Parking the whole cluster stops the relay from walking all of the
+          // keys just to collect the same rejection.
+          if (route.clusterId) store.coolDownCluster(route.clusterId, 60 * 1000, 'shared');
+          sharedLimitHit = true;
+        } else if (route.poolKey) {
+          const waitMs = parseRetryWaitMs(failureMessage);
+          store.coolDownPoolKey(route.poolKey, 'rate', waitMs || 60 * 1000);
+        }
+      } else if (upstreamRes.status === 402) {
+        if (route.poolKey) store.coolDownPoolKey(route.poolKey, 'daily');
+      } else if (upstreamRes.status === 404 && isModelUnavailable(failureMessage)) {
+        // The account exists but does not carry this model right now. The
+        // upstream rotates the catalogue behind the keys, so the park is short:
+        // long enough to skip the key for this burst, short enough that it
+        // comes back into rotation on its own.
+        if (route.poolKey) store.notePoolKeyModelUnavailable(route.poolKey, route.targetModel, 5 * 60 * 1000);
+      }
+      if (sharedLimitHit) break;
+    } catch (err) {
+      clearTimeout(timer);
+      lastStatus = 502;
+    } finally {
+      releaseSlot();
+    }
+  }
+
+  const logEmail = owner ? owner.email : 'Relay Client';
+  if (!chosenRes) {
+    store.recordRequestLog({
+      email: logEmail,
+      keyPrefix: keyRec ? keyRec.prefix : '—',
+      model: askedModel,
+      status: lastStatus,
+      tokens: 0,
+    });
+    if (!res.headersSent) {
+      // 502 is swallowed by the edge and replaced with its own HTML page, so
+      // a failed upstream is reported as 503 (or 429 for a rate limit) and the
+      // JSON body reaches the client.
+      const failStatus = lastStatus === 429 ? 429 : 503;
+      if (lastStatus === 429) {
+        const clusterId = (lastRoute && lastRoute.clusterId) || (modelEntry && modelEntry.routeCluster) || '';
+        const waitMs = clusterId ? store.getClusterCooldownRemaining(clusterId) : 0;
+        if (waitMs > 0) res.setHeader('Retry-After', String(Math.ceil(waitMs / 1000)));
+      }
+      return res.status(failStatus).json({
+        error: { message: `Gateway upstream error (HTTP ${lastStatus})`, type: 'upstream_error' },
+      });
+    }
+    return;
+  }
+
+  let hb = null;
+  try {
+    if (stream) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+
+      let clientClosed = false;
+      req.on('close', () => {
+        clientClosed = true;
+        try { chosenReader?.cancel(); } catch {}
+      });
+
+      hb = setInterval(() => {
+        if (!clientClosed && !res.writableEnded) {
+          try { res.write(': ping\n\n'); } catch {}
+        }
+      }, 12000);
+
+      const decoder = new TextDecoder();
+      let approxTokens = 0;
+
+      if (chosenFirstChunk && !clientClosed && !res.writableEnded) {
+        const firstText = decoder.decode(chosenFirstChunk, { stream: true });
+        if (firstText) {
+          const step = Math.max(1, Math.floor(firstText.length / 4));
+          approxTokens += step;
+          totalTokens += step;
+          res.write(scrubSseText(firstText, askedModel));
+        }
+      }
+
+      while (!clientClosed && !res.writableEnded) {
+        const { done, value } = await chosenReader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        if (chunk) {
+          const step = Math.max(1, Math.floor(chunk.length / 4));
+          approxTokens += step;
+          totalTokens += step;
+          res.write(scrubSseText(chunk, askedModel));
+        }
+      }
+      clearInterval(hb);
+      hb = null;
+      if (!res.writableEnded) res.end();
+
+      if (keyRec) store.touchApiKey(keyRec.id, owner?.id, approxTokens);
+      else if (owner) store.touchUser(owner.id, approxTokens);
+      store.recordRequestLog({
+        email: logEmail,
+        keyPrefix: keyRec ? keyRec.prefix : '—',
+        model: askedModel,
+        status: 200,
+        tokens: approxTokens,
+      });
+    } else {
+      const data = scrubJsonPayload(chosenJsonData, askedModel);
+      const usedTokens = data.usage?.total_tokens || 50;
+      totalTokens += usedTokens;
+      if (keyRec) store.touchApiKey(keyRec.id, owner?.id, usedTokens);
+      else if (owner) store.touchUser(owner.id, usedTokens);
+      store.recordRequestLog({
+        email: logEmail,
+        keyPrefix: keyRec ? keyRec.prefix : '—',
+        model: askedModel,
+        status: 200,
+        tokens: usedTokens,
+      });
+      res.json(data);
+    }
+  } catch (err) {
+    if (hb) clearInterval(hb);
+    console.error('Relay stream error:', err && err.message ? err.message : err);
+    if (!res.headersSent) {
+      res.status(503).json({ error: { message: 'Relay gateway connection failed', type: 'gateway_error' } });
+    } else if (!res.writableEnded) {
+      try {
+        res.write(`data: ${JSON.stringify({ error: { message: 'Upstream stream interrupted' } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      } catch {}
+    }
+  }
+});
+
+// Unknown paths answer in JSON: the relay has no HTML surface left.
+app.use((req, res) => {
+  res.status(404).json({ error: { message: 'Not found', type: 'not_found', path: req.path } });
+});
+
+// The relay listens first and warms up behind a gate. Postgres and the vault
+// can take a minute on a cold start, and a health check that waits for them is
+// how deployments end up marked failed.
+let booted = false;
+app.use((req, res, next) => {
+  if (booted) return next();
+  if (req.path === '/health' || req.path === '/health-json') return next();
+  res.setHeader('Retry-After', '5');
+  return res.status(503).json({ error: { message: 'Relay is warming up', type: 'warming_up' } });
+});
+
+(async () => {
+  const srv = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Zarnkina Relay listening on port ${PORT} - warming up`);
+  });
+  srv.requestTimeout = 0;
+  srv.headersTimeout = 120000;
+  srv.keepAliveTimeout = 65000;
+
+  try {
+    await store.initAsync();
+  } catch (err) {
+    console.warn('[boot] state init failed, serving what we have:', err && err.message);
+  }
+  booted = true;
+  console.log(`Zarnkina Relay ready - Active pool keys: ${store.getTotalActivePoolKeys()}`);
+})();

@@ -1,0 +1,10 @@
+.git
+.env
+data/
+extracted-keys.json
+extract.cjs
+push-keys.cjs
+sync-pools.cjs
+node_modules/
+*.log
+tests/
